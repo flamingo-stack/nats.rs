@@ -499,7 +499,7 @@ impl Connector {
                     
                     // Check if this is an HTTP authentication error during WebSocket handshake
                     // Only treat as auth error if it's a real HTTP 401, not generic connection issues
-                    if (is_auth_error(&error_text)) {
+                     if (Self::is_auth_error(&error_text)) {
                         tracing::info!("Detected WebSocket HTTP 401 error, treating as authorization violation");
                         ConnectError::with_source(crate::ConnectErrorKind::AuthorizationViolation, err)
                     } else {
@@ -535,7 +535,7 @@ impl Connector {
                     
                     // Check if this is an HTTP authentication error during WebSocket handshake
                     // Only treat as auth error if it's a real HTTP 401, not generic connection issues
-                    if (is_auth_error(&error_text)) {
+                     if (Self::is_auth_error(&error_text)) {
                         tracing::info!("Detected WebSocket TLS HTTP 401 error, treating as authorization violation");
                         ConnectError::with_source(crate::ConnectErrorKind::AuthorizationViolation, err)
                     } else {
