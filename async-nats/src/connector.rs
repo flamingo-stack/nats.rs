@@ -203,7 +203,7 @@ impl Connector {
 
     /// Checks if an error is authentication-related
     fn is_auth_error(error: &str) -> bool {
-        error.contains("401")
+        error.contains("status code 401")
     }
 
     pub(crate) async fn try_connect(&mut self) -> Result<(ServerInfo, Connection), ConnectError> {
