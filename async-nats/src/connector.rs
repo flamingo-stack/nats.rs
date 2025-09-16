@@ -179,10 +179,9 @@ impl Connector {
                         Err(parse_err) => {
                             tracing::error!(
                                 error = %parse_err, 
-                                new_url = %new_url,
                                 "Failed to parse new URL from auth_url_callback"
                             );
-                            tracing::info!("Auth URL callback returned invalid URL: '{}'", new_url);
+                            tracing::info!("Auth URL callback returned invalid URL");
                         }
                     }
                 }
@@ -500,7 +499,7 @@ impl Connector {
                     
                     // Check if this is an HTTP authentication error during WebSocket handshake
                     // Only treat as auth error if it's a real HTTP 401, not generic connection issues
-                    if (error_text.contains("401")) {
+                    if (is_auth_error(&error_text)) {
                         tracing::info!("Detected WebSocket HTTP 401 error, treating as authorization violation");
                         ConnectError::with_source(crate::ConnectErrorKind::AuthorizationViolation, err)
                     } else {
@@ -536,7 +535,7 @@ impl Connector {
                     
                     // Check if this is an HTTP authentication error during WebSocket handshake
                     // Only treat as auth error if it's a real HTTP 401, not generic connection issues
-                    if (error_text.contains("status code 401")) {
+                    if (is_auth_error(&error_text)) {
                         tracing::info!("Detected WebSocket TLS HTTP 401 error, treating as authorization violation");
                         ConnectError::with_source(crate::ConnectErrorKind::AuthorizationViolation, err)
                     } else {
