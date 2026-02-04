@@ -1867,9 +1867,26 @@ fn is_default<T: Default + Eq>(t: &T) -> bool {
 #[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
 pub struct ClusterInfo {
     /// The cluster name.
+    #[serde(default)]
     pub name: Option<String>,
+    /// The RAFT group name.
+    #[serde(default)]
+    pub raft_group: Option<String>,
     /// The server name of the RAFT leader.
+    #[serde(default)]
     pub leader: Option<String>,
+    /// The time since this server has been the leader.
+    #[serde(default, with = "rfc3339::option")]
+    pub leader_since: Option<OffsetDateTime>,
+    /// Indicates if this account is a system account.
+    #[cfg(feature = "server_2_12")]
+    #[serde(default)]
+    /// Indicates if `traffic_account` is set a system account.
+    pub system_account: bool,
+    #[cfg(feature = "server_2_12")]
+    /// Name of the traffic (replication) account.
+    #[serde(default)]
+    pub traffic_account: Option<String>,
     /// The members of the RAFT cluster.
     #[serde(default)]
     pub replicas: Vec<PeerInfo>,
