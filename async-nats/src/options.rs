@@ -13,6 +13,7 @@
 
 use crate::auth::Auth;
 use crate::connector;
+use crate::header::HeaderMap;
 use crate::{Client, ConnectError, Event, ToServerAddrs};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::engine::Engine;
@@ -66,6 +67,7 @@ pub struct ConnectOptions {
     pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
     pub(crate) auth_url_callback: Option<CallbackArg1<(), Result<String, AuthError>>>,
+    pub(crate) headers: Option<HeaderMap>,
 }
 
 impl fmt::Debug for ConnectOptions {
@@ -86,6 +88,7 @@ impl fmt::Debug for ConnectOptions {
             .entry(&"inbox_prefix", &self.inbox_prefix)
             .entry(&"retry_on_initial_connect", &self.retry_on_initial_connect)
             .entry(&"read_buffer_capacity", &self.read_buffer_capacity)
+            .entry(&"headers", &self.headers)
             .finish()
     }
 }
@@ -119,6 +122,7 @@ impl Default for ConnectOptions {
             auth: Default::default(),
             auth_callback: None,
             auth_url_callback: None,
+            headers: None,
         }
     }
 }
@@ -938,6 +942,52 @@ impl ConnectOptions {
         self.auth_url_callback = Some(CallbackArg1::<(), Result<String, AuthError>>(Box::new(
             move |()| Box::pin(callback(())),
         )));
+        self
+    }
+
+    /// Sets default headers that will be included with every message published by the client.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// let mut headers = async_nats::HeaderMap::new();
+    /// headers.insert("X-Trace-Id", "abc123");
+    ///
+    /// let nc = async_nats::ConnectOptions::new()
+    ///     .headers(headers)
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn headers(mut self, headers: HeaderMap) -> ConnectOptions {
+        self.headers = Some(headers);
+        self
+    }
+
+    /// Adds a custom header that will be included with every message published by the client.
+    /// Can be called multiple times to add multiple headers.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// let nc = async_nats::ConnectOptions::new()
+    ///     .custom_header("x-machine-id", "machine-123")
+    ///     .custom_header("x-tenant-id", "tenant-456")
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn custom_header<N, V>(mut self, name: N, value: V) -> ConnectOptions
+    where
+        N: crate::header::IntoHeaderName,
+        V: crate::header::IntoHeaderValue,
+    {
+        let headers = self.headers.get_or_insert_with(HeaderMap::new);
+        headers.insert(name, value);
         self
     }
 }

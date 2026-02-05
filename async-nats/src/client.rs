@@ -87,6 +87,7 @@ pub struct Client {
     request_timeout: Option<Duration>,
     max_payload: Arc<AtomicUsize>,
     connection_stats: Arc<Statistics>,
+    default_headers: Option<HeaderMap>,
 }
 
 pub mod traits {
@@ -193,6 +194,7 @@ impl Client {
         request_timeout: Option<Duration>,
         max_payload: Arc<AtomicUsize>,
         statistics: Arc<Statistics>,
+        default_headers: Option<HeaderMap>,
     ) -> Client {
         let poll_sender = PollSender::new(sender.clone());
         Client {
@@ -206,6 +208,7 @@ impl Client {
             request_timeout,
             max_payload,
             connection_stats: statistics,
+            default_headers,
         }
     }
 
@@ -222,6 +225,26 @@ impl Client {
     /// ```
     pub fn timeout(&self) -> Option<Duration> {
         self.request_timeout
+    }
+
+    /// Merges the provided headers with default headers.
+    /// Headers passed explicitly take precedence over default headers.
+    fn merge_headers(&self, headers: Option<HeaderMap>) -> Option<HeaderMap> {
+        match (&self.default_headers, headers) {
+            (None, headers) => headers,
+            (Some(defaults), None) => Some(defaults.clone()),
+            (Some(defaults), Some(mut headers)) => {
+                // Merge default headers into the provided headers (provided headers take precedence)
+                for (name, values) in defaults.iter() {
+                    if headers.get(name.clone()).is_none() {
+                        for value in values {
+                            headers.append(name.clone(), value.clone());
+                        }
+                    }
+                }
+                Some(headers)
+            }
+        }
     }
 
     /// Returns last received info from the server.
@@ -323,7 +346,7 @@ impl Client {
                 subject,
                 payload,
                 reply: None,
-                headers: None,
+                headers: self.merge_headers(None),
             }))
             .await?;
         Ok(())
@@ -361,7 +384,7 @@ impl Client {
                 subject,
                 payload,
                 reply: None,
-                headers: Some(headers),
+                headers: self.merge_headers(Some(headers)),
             }))
             .await?;
         Ok(())
@@ -397,7 +420,7 @@ impl Client {
                 subject,
                 payload,
                 reply: Some(reply),
-                headers: None,
+                headers: self.merge_headers(None),
             }))
             .await?;
         Ok(())
@@ -436,7 +459,7 @@ impl Client {
                 subject,
                 payload,
                 reply: Some(reply),
-                headers: Some(headers),
+                headers: self.merge_headers(Some(headers)),
             }))
             .await?;
         Ok(())
@@ -555,7 +578,7 @@ impl Client {
 
             let payload = request.payload.unwrap_or_default();
             let respond = self.new_inbox().into();
-            let headers = request.headers;
+            let headers = self.merge_headers(request.headers);
 
             self.sender
                 .send(Command::Request {
