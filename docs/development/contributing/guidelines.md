@@ -1,15 +1,15 @@
-# Contributing to nats.rs
+# Contributing Guidelines
 
-Thank you for contributing to `nats.rs` — the Flamingo-maintained Rust async client for NATS with OpenFrame JWT integration!
-
-This document covers the code style conventions, branch naming, commit message format, and pull request process for this repository.
+Thank you for contributing to `nats.rs`! This guide covers the code style conventions, branch naming, commit message format, and pull request process for this repository.
 
 ---
 
-## Before You Start
+## Getting Started
 
-1. Read the [Architecture Overview](docs/development/architecture/README.md) to understand the codebase structure.
-2. Set up your environment following the [Environment Setup](docs/development/setup/environment.md) guide.
+Before contributing:
+
+1. Read the [Architecture Overview](../architecture/README.md) to understand the codebase structure.
+2. Set up your environment following the [Environment Setup](../setup/environment.md) guide.
 3. Confirm the full test suite passes on your machine before making changes.
 
 ```bash
@@ -17,52 +17,6 @@ git clone https://github.com/flamingo-stack/nats.rs.git
 cd nats.rs
 cargo test --manifest-path async-nats/Cargo.toml
 ```
-
----
-
-## Development Environment
-
-### Required Toolchain
-
-Install the Rust stable toolchain via `rustup`:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup toolchain install stable
-rustup component add rustfmt clippy
-```
-
-Verify:
-
-```bash
-rustc --version    # 1.75.0 or newer
-cargo --version
-rustfmt --version
-cargo clippy --version
-```
-
-### Recommended IDE
-
-**Visual Studio Code** with the `rust-analyzer` extension is the recommended setup. Suggested settings (`.vscode/settings.json`):
-
-```json
-{
-  "rust-analyzer.checkOnSave.command": "clippy",
-  "rust-analyzer.cargo.features": "all",
-  "editor.formatOnSave": true,
-  "rust-analyzer.inlayHints.enable": true,
-  "rust-analyzer.inlayHints.chainingHints.enable": true
-}
-```
-
-**JetBrains RustRover** and **Neovim** with `nvim-lspconfig` + `rust_analyzer` are also fully supported.
-
-### Useful Environment Variables
-
-| Variable | Purpose |
-|---|---|
-| `RUST_LOG` | Enables tracing output (e.g., `RUST_LOG=async_nats=debug`) |
-| `RUST_BACKTRACE` | Enables full backtraces on panic (`RUST_BACKTRACE=1`) |
 
 ---
 
@@ -76,9 +30,11 @@ All code must be formatted with `rustfmt`. CI will reject unformatted code:
 cargo fmt --all
 ```
 
+The project uses the default `rustfmt` configuration. Do not add custom `rustfmt.toml` overrides without team discussion.
+
 ### Linting
 
-All `clippy` warnings are treated as errors. Run clippy before submitting:
+All warnings produced by `clippy` are treated as errors. Run clippy before submitting:
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings
@@ -101,7 +57,7 @@ Follow standard Rust naming conventions:
 ### Error Handling
 
 - Use the crate's `Error<Kind>` type for typed errors on public APIs.
-- Do not use `unwrap()` in library code — use `?` propagation or explicit error handling.
+- Do not use `unwrap()` in library code; use `?` propagation or explicit error handling.
 - `unwrap()` and `expect()` are acceptable only in tests and examples.
 
 ### Async Code
@@ -112,7 +68,9 @@ Follow standard Rust naming conventions:
 
 ### Documentation
 
-All `pub` items must have doc comments (`///`). Include a short example for public API types and functions. Use `# Errors` and `# Panics` sections where relevant:
+- All `pub` items must have doc comments (`///`).
+- Include a short example in doc comments for public API types and functions.
+- Use `# Errors` and `# Panics` sections in doc comments where relevant.
 
 ```rust
 /// Publishes a message to the given subject.
@@ -175,14 +133,23 @@ Follow the [Conventional Commits](https://www.conventionalcommits.org/) specific
 | `chore` | Dependency bumps, CI config, build scripts |
 | `perf` | Performance improvement |
 
-**Scope** (optional): use the crate or module name — `async-nats`, `connector`, `jetstream`, `kv`, `tls`, `service`.
+### Scope (optional)
+
+Use the crate or module name as scope: `async-nats`, `connector`, `jetstream`, `kv`, `tls`, `service`.
 
 ### Examples
 
 ```text
 feat(connector): add auth_url_callback for OpenFrame JWT refresh
 
+Adds a new `auth_url_callback` option to `ConnectOptions` that is invoked
+by the Connector when the server returns an Authorization Violation.
+The callback should return a fresh server URL containing an updated JWT.
+
 fix(kv): reject keys that start or end with a dot
+
+Validation in `is_valid_key()` now correctly rejects keys like ".bad"
+and "also.bad." in addition to keys containing invalid characters.
 
 docs(jetstream): add pull consumer example to module doc comment
 
@@ -191,7 +158,7 @@ test(tls): add test for TLS-first auto-detection mode
 
 ### Short Description Rules
 
-- Use the imperative mood: "add", "fix", "update" — not "added", "fixed", "updated"
+- Use the imperative mood: "add", "fix", "update", not "added", "fixed", "updated"
 - No capital letter at the start
 - No period at the end
 - Maximum 72 characters
@@ -208,12 +175,14 @@ test(tls): add test for TLS-first auto-detection mode
 - [ ] New public API items have doc comments with examples
 - [ ] New features have integration tests
 
-### PR Description Template
+### PR Description
+
+Use this template for your PR description:
 
 ```text
 ## Summary
 
-What does this PR do? (1–3 sentences)
+What does this PR do? (1-3 sentences)
 
 ## Changes
 
@@ -238,73 +207,11 @@ Does this introduce any breaking changes to the public API?
 
 ---
 
-## Testing
-
-Tests require a `nats-server` binary on your `$PATH`. The `nats_test_server` helper crate automatically manages server lifecycle for integration tests.
-
-```bash
-# Full test suite
-cargo test --manifest-path async-nats/Cargo.toml
-
-# Specific test file
-cargo test --manifest-path async-nats/Cargo.toml --test client_tests
-
-# Specific test by name
-cargo test --manifest-path async-nats/Cargo.toml -- basic_pub_sub
-
-# With server_2_10 features
-cargo test --manifest-path async-nats/Cargo.toml --features server_2_10
-
-# With debug logging
-RUST_LOG=async_nats=debug cargo test --manifest-path async-nats/Cargo.toml -- --nocapture
-
-# Using cargo-nextest (faster)
-cargo nextest run --manifest-path async-nats/Cargo.toml
-```
-
-### Writing New Tests
-
-All integration tests are `async` and use `#[tokio::test]`. Add new tests to the appropriate file in `async-nats/tests/`:
-
-```rust
-#[tokio::test]
-async fn my_new_feature_test() {
-    let server = nats_server::run_server("tests/configs/jetstream.conf");
-    let client = async_nats::connect(server.client_url())
-        .await
-        .unwrap();
-
-    // Exercise the feature and assert expectations
-}
-```
-
----
-
-## Security Checklist for Auth / Connection PRs
-
-Before merging any PR that touches authentication or connection code:
-
-- [ ] No credentials or secrets hard-coded in source files or tests
-- [ ] Test credentials use clearly fake placeholder values (not real tokens)
-- [ ] All new `ConnectOptions` fields accepting credential material use appropriate visibility
-- [ ] Any new auth callback accepts and returns the correct `Auth` type
-- [ ] TLS configuration is not silently downgraded
-- [ ] Subject inputs are validated or typed as `Subject` before use
-- [ ] Error messages do not leak credential content
-
----
-
 ## Community
 
-Flamingo does not use GitHub Issues or GitHub Discussions. All support, questions, and community conversation happen on the **OpenMSP Slack**:
+All discussion, questions, and community support happen on the **OpenMSP Slack** — not GitHub Issues or Discussions:
 
 - Join at [https://www.openmsp.ai/](https://www.openmsp.ai/)
 - Invite: [https://join.slack.com/t/openmsp/shared_invite/zt-36bl7mx0h-3~U2nFH6nqHqoTPXMaHEHA](https://join.slack.com/t/openmsp/shared_invite/zt-36bl7mx0h-3~U2nFH6nqHqoTPXMaHEHA)
 
 For bugs or feature requests, open a PR directly with a description of the problem and proposed solution, or discuss it in Slack first.
-
----
-
-<div align="center">
-  Built with 💛 by the <a href="https://www.flamingo.run/about"><b>Flamingo</b></a> team
-</div>

@@ -1,0 +1,28 @@
+graph TD
+    App["OpenFrame Service / User Application"]
+    ConnOpts["ConnectOptions"]
+    Client["async_nats::Client (cloneable handle)"]
+    Connector["Connector (connection manager)"]
+    Connection["Connection (framed TCP/TLS/WS)"]
+    NATS["NATS Server"]
+    Auth["Auth (JWT / NKey / Token / Password)"]
+    AuthCB["auth_url_callback (JWT Refresh)"]
+    OpenFrameAuth["OpenFrame Auth API"]
+    JetStream["JetStream Context"]
+    KV["Key-Value Store"]
+    ObjStore["Object Store"]
+    SvcAPI["Service API"]
+
+    App --> ConnOpts
+    ConnOpts --> Auth
+    ConnOpts --> AuthCB
+    AuthCB --> OpenFrameAuth
+    ConnOpts --> Connector
+    Connector --> Connection
+    Connection --> NATS
+    Connector --> Client
+    Client --> JetStream
+    Client --> KV
+    Client --> ObjStore
+    Client --> SvcAPI
+    App --> Client

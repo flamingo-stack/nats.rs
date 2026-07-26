@@ -1,0 +1,26 @@
+sequenceDiagram
+    participant App as Application
+    participant Opts as ConnectOptions
+    participant Conn as Connector
+    participant TCP as Connection (TCP/TLS)
+    participant NATS as NATS Server
+    participant AuthCB as auth_url_callback
+    participant OFAuth as OpenFrame Auth API
+
+    App->>Opts: build with jwt_token_callback / credentials
+    Opts->>Conn: construct Connector with ConnectorOptions
+    Conn->>TCP: open TCP / TLS / WebSocket stream
+    TCP->>NATS: send CONNECT info (JWT, nkey sig, token)
+    NATS-->>TCP: +OK or -ERR Authorization Violation
+    alt Authorization Violation
+        TCP-->>Conn: ConnectErrorKind::AuthorizationViolation
+        Conn->>AuthCB: call auth_url_callback()
+        AuthCB->>OFAuth: POST /api/oauth/token (refresh_token / client_credentials)
+        OFAuth-->>AuthCB: fresh JWT
+        AuthCB-->>Conn: updated Auth
+        Conn->>TCP: reconnect with fresh credentials
+        TCP->>NATS: send CONNECT info (new JWT)
+        NATS-->>TCP: +OK
+    end
+    TCP-->>Conn: ServerInfo
+    Conn-->>App: Client handle

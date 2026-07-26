@@ -1,0 +1,26 @@
+graph LR
+    ConnectOptions["ConnectOptions"]
+    Auth["Auth struct"]
+    Connector["Connector"]
+    Connection["Connection"]
+    Client["Client"]
+    JetStream["JetStream Context"]
+    KV["KV Store"]
+    ObjStore["Object Store"]
+    SvcAPI["Service API"]
+    TLS["tls::config_tls"]
+    AuthUtils["auth_utils"]
+    Crypto["crypto::Sha256"]
+
+    ConnectOptions --> Auth
+    ConnectOptions --> Connector
+    ConnectOptions --> TLS
+    Auth --> AuthUtils
+    Connector --> Connection
+    Connector --> TLS
+    Connection --> Crypto
+    Connector --> Client
+    Client --> JetStream
+    JetStream --> KV
+    JetStream --> ObjStore
+    JetStream --> SvcAPI

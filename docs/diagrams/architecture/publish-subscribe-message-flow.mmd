@@ -1,0 +1,13 @@
+sequenceDiagram
+    participant Pub as Publisher (Client)
+    participant Chan as mpsc::Sender<Command>
+    participant ConnTask as Connection Task
+    participant NATS as NATS Server
+    participant Sub as Subscriber (Client)
+
+    Pub->>Chan: Command::Publish(subject, payload)
+    Chan->>ConnTask: dequeue Command
+    ConnTask->>NATS: PUB subject payload CRLF
+    NATS-->>ConnTask: MSG subject sid payload CRLF
+    ConnTask->>Sub: route via subscription channel
+    Sub-->>Pub: Message { subject, payload, headers }
