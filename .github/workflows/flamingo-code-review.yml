@@ -45,6 +45,10 @@ on:
         description: 'Absolute hub origin. Dispatches carry it doc-orchestrator style; pull_request runs fall back to the org/repo Actions variable FLAMINGO_HUB_BASE_URL (shipped by Sync Secrets).'
         required: false
         default: ''
+      mining:
+        description: 'true when this dispatch is a rule-MINING run: the run script executes code-review-mine.mjs against the full checkout and the callback carries suggested_rules instead of findings.'
+        required: false
+        default: 'false'
     # ═══════════════════════════════════════════════════════════════════════════
     # END GENERATED SECTION
     # ═══════════════════════════════════════════════════════════════════════════
@@ -59,9 +63,12 @@ env:
   RUN_ID: ${{ github.event.client_payload.run_id || github.event.inputs.run_id || '' }}
   MODE: ${{ github.event.client_payload.mode || github.event.inputs.mode || (github.event_name == 'pull_request' && 'pr' || 'sweep') }}
   HUB_BASE_URL: ${{ github.event.client_payload.hub_base_url || github.event.inputs.hub_base_url || vars.FLAMINGO_HUB_BASE_URL }}
+  MINING: ${{ github.event.client_payload.mining || github.event.inputs.mining || '' }}
 
-# Superseding a PR cancels the in-flight REVIEW only. The gate job is outside
-# this group on purpose: a cancelled required check is a merge deadlock.
+# Superseding a PR cancels the in-flight review of the stale head SHA; the
+# fresh run reviews (and reports on) the new one. The always() report step
+# still fires on the cancelled run, so its row records 'cancelled' rather
+# than dangling.
 concurrency:
   group: flamingo-code-review-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
@@ -90,16 +97,22 @@ jobs:
         github.event.pull_request.user.type != 'Bot' &&
         github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Sweep mode scans the WHOLE repo, not a diff — budgeted accordingly
+    # (the doc sibling budgets 720 for its whole-repo stages).
+    timeout-minutes: 60
     steps:
       # Fail LOUD, not silent: a pull_request run on a repo whose org never set
       # FLAMINGO_HUB_BASE_URL would otherwise curl an empty origin and die with
-      # an unrelated error.
+      # an unrelated error. Also normalizes a trailing slash ONCE for every
+      # downstream consumer (a value of https://hub.example/ would otherwise
+      # yield //api double-slash paths in four places).
       - name: Validate configuration
-        if: env.HUB_BASE_URL == ''
         run: |
-          echo "::error::HUB_BASE_URL is empty — set the org Actions variable FLAMINGO_HUB_BASE_URL (or pass hub_base_url in the dispatch payload)."
-          exit 1
+          if [ -z "$HUB_BASE_URL" ]; then
+            echo "::error::HUB_BASE_URL is empty — set the org Actions variable FLAMINGO_HUB_BASE_URL (or pass hub_base_url in the dispatch payload)."
+            exit 1
+          fi
+          echo "HUB_BASE_URL=${HUB_BASE_URL%/}" >> "$GITHUB_ENV"
 
       - name: Check out the code under review
         uses: actions/checkout@v4
@@ -134,9 +147,10 @@ jobs:
         env:
           WEBHOOK_SECRET: ${{ secrets.DOC_ORCH_WEBHOOK_SECRET }}
           HASH_WORKFLOW_HELPERS: "11c1019fe69a24325d3849ea27bce73ec81591e3d6f6a72f3b3421cfb72551ea"
-          HASH_FETCH_RULES: "8b5060f1e66a38c270a28781877cfb54b5e03a510221a9a09fead85bb72c275e"
-          HASH_RUN: "4da93a3c9be8a4b11da6a258be3b4b57f6672c7e4491e407b6d57fcc7d6eb837"
-          HASH_REPORT: "4118e728436182e42e0064bd3a98da58d01b2595304c8f390ba00be6daac5220"
+          HASH_FETCH_RULES: "6e32dc7ffa1d40804fad96f70bb6b9768d4c4344f9629cc0b04c441d974b9335"
+          HASH_RUN: "e42061274fac2684ec60bffcf9c2d0ffdbf4c38162d14961bc786bdf867caee6"
+          HASH_REPORT: "c450101bb0fd9cf02b6eb78a1690b705a62bd28bcd883d33ee4cd498a91e747d"
+          HASH_MINE: "de8214d4f9236ae086b4ff9d46128e51a08d6bba6d5c4a1b1973cfbeba1d6310"
         run: |
           set -euo pipefail
           SCRIPTS_BASE_URL="${HUB_BASE_URL}/api/doc-orchestrator/scripts"
@@ -172,6 +186,7 @@ jobs:
           download_and_verify "code-review-fetch-rules.sh" "$HASH_FETCH_RULES"
           download_and_verify "code-review-run.sh" "$HASH_RUN"
           download_and_verify "code-review-report.sh" "$HASH_REPORT"
+          download_and_verify "code-review-mine.mjs" "$HASH_MINE"
 
       - name: Fetch the rule corpus
         id: rules
@@ -187,17 +202,25 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: /tmp/code-review-run.sh
 
+      # A missing /tmp script here means the DOWNLOAD step failed (endpoint
+      # down, hash mismatch) — no callback can be sent; the hub's sweep job
+      # reaps runs stuck past their deadline, so the row does not dangle.
       - name: Report back to the hub
         if: always() && env.HUB_BASE_URL != ''
-        # RUN_ID / RUN_TOKEN / MODE / HUB_BASE_URL arrive via the generated
-        # workflow-level env. Step env carries only the secret plus values that
-        # exist nowhere but the GitHub context — which enters through env,
-        # never interpolated into a script body (doc-workflow discipline).
+        # RUN_ID / MODE / HUB_BASE_URL arrive via the generated workflow-level
+        # env. RUN_TOKEN is SENSITIVE (per-run bearer) so it is step-scoped
+        # HERE — the only consumer — and masked by the script; the review step
+        # that processes untrusted PR content never sees it. Remaining step env
+        # is the secret plus values that exist nowhere but the GitHub context —
+        # which enters through env, never interpolated into a script body.
         env:
           WEBHOOK_SECRET: ${{ secrets.DOC_ORCH_WEBHOOK_SECRET }}
+          RUN_TOKEN: ${{ github.event.client_payload.run_token || github.event.inputs.run_token || '' }}
           JOB_STATUS: ${{ job.status }}
           DEGRADED: ${{ steps.rules.outputs.degraded }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Dispatch events carry no pull_request context — github.sha is the
+          # tip of the checked-out ref, so sweep runs record the commit too.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           WF_RUN_ID: ${{ github.run_id }}
           REPO_FULL: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
