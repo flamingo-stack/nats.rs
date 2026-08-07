@@ -9,6 +9,21 @@ on:
     types: [opened, synchronize, ready_for_review, reopened]
   repository_dispatch:
     types: [flamingo-code-review]
+  # Lets the hub target a SETUP BRANCH before the install PR merges — the same
+  # test-before-merge flow the doc pipeline uses. repository_dispatch only ever
+  # fires on the default branch.
+  workflow_dispatch:
+    inputs:
+      run_id:
+        required: false
+        type: string
+      run_token:
+        required: false
+        type: string
+      mode:
+        required: false
+        type: string
+        default: sweep
 
 # Superseding a PR cancels the in-flight REVIEW only. The gate job is outside
 # this group on purpose: a cancelled required check is a merge deadlock.
@@ -31,6 +46,7 @@ jobs:
     # invisible to the admin screen and would produce no callback at all.
     if: >-
       (github.event_name == 'repository_dispatch' ||
+       github.event_name == 'workflow_dispatch' ||
        (github.event.pull_request.draft == false &&
         github.event.pull_request.user.type != 'Bot' &&
         github.event.pull_request.head.repo.full_name == github.repository))
@@ -60,10 +76,42 @@ jobs:
           restore-keys: |
             flamingo-rules-hash-${{ github.repository }}-
 
+      # Same download_and_verify + hash-pinning discipline as the
+      # doc-orchestrator workflow, fetching the SAME workflow-helpers.sh from
+      # the SAME scripts endpoint. send_webhook comes from there — the report
+      # step does not hand-roll its own callback curl.
+      - name: Fetch shared workflow helpers
+        env:
+          HUB_URL: "https://admin-hub.flamingo.so"
+          WEBHOOK_SECRET: ${{ secrets.DOC_ORCH_WEBHOOK_SECRET }}
+          HASH_WORKFLOW_HELPERS: "11c1019fe69a24325d3849ea27bce73ec81591e3d6f6a72f3b3421cfb72551ea"
+        run: |
+          set -euo pipefail
+          download_and_verify() {
+            local script_name="$1"
+            local expected_hash="$2"
+            local output_path="/tmp/$script_name"
+            curl -fsSL "$HUB_URL/api/doc-orchestrator/scripts/$script_name" \
+              -H "Authorization: Bearer $WEBHOOK_SECRET" \
+              -o "$output_path"
+            local actual_hash=$(shasum -a 256 "$output_path" | cut -d' ' -f1)
+            if [ "$actual_hash" != "$expected_hash" ]; then
+              echo "HASH MISMATCH for $script_name"
+              echo "   Expected: $expected_hash"
+              echo "   Actual:   $actual_hash"
+              exit 1
+            fi
+            if [[ "$script_name" == *.sh ]]; then
+              chmod +x "$output_path"
+            fi
+            echo "$script_name verified"
+          }
+          download_and_verify "workflow-helpers.sh" "$HASH_WORKFLOW_HELPERS"
+
       - name: Fetch the rule corpus
         id: rules
         env:
-          HUB_URL: "http://localhost:3000"
+          HUB_URL: "https://admin-hub.flamingo.so"
           REPO_NAME: "NATS Rust Client"
           WEBHOOK_SECRET: ${{ secrets.DOC_ORCH_WEBHOOK_SECRET }}
         run: |
@@ -110,8 +158,8 @@ jobs:
         if: steps.rules.outputs.skip != 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MODE: ${{ github.event_name == 'repository_dispatch' && 'sweep' || 'pr' }}
-          RUN_ID: ${{ github.event.client_payload.run_id }}
+          MODE: ${{ github.event_name == 'pull_request' && 'pr' || 'sweep' }}
+          RUN_ID: ${{ github.event.client_payload.run_id || inputs.run_id }}
         run: |
           set -euo pipefail
           # The reviewer itself is delivered by the hub as a hash-pinned script
@@ -123,40 +171,55 @@ jobs:
       - name: Report back to the hub
         if: always()
         env:
-          HUB_URL: "http://localhost:3000"
+          HUB_URL: "https://admin-hub.flamingo.so"
           WEBHOOK_SECRET: ${{ secrets.DOC_ORCH_WEBHOOK_SECRET }}
-          RUN_ID: ${{ github.event.client_payload.run_id }}
+          RUN_ID: ${{ github.event.client_payload.run_id || inputs.run_id }}
           # Minted per run by the hub and shipped in the dispatch. It binds this
           # callback to THIS run: the org-wide secret alone would let any repo's
-          # workflow report against another repo's run.
-          RUN_TOKEN: ${{ github.event.client_payload.run_token }}
+          # workflow report against another repo's run. Travels in the payload
+          # because send_webhook posts JSON and adds no custom headers.
+          RUN_TOKEN: ${{ github.event.client_payload.run_token || inputs.run_token }}
+          # ALL GitHub context enters through env, never interpolated into the
+          # script body — same discipline as the doc-orchestrator workflow.
+          JOB_STATUS: ${{ job.status }}
+          DEGRADED: ${{ steps.rules.outputs.degraded }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WF_RUN_ID: ${{ github.run_id }}
+          REPO_FULL: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_MODE: ${{ github.event_name == 'pull_request' && 'pr' || 'sweep' }}
         run: |
           set -euo pipefail
+          # send_webhook comes from the doc-orchestrator's verified helpers —
+          # the same function every documentation run reports through.
+          source /tmp/workflow-helpers.sh
+          if [ -n "${DEGRADED:-}" ]; then STATUS=neutral; else STATUS="$JOB_STATUS"; fi
           # A sweep carries its run id from the dispatch. A PR run has none, so
           # the hub creates the row from this callback.
-          jq -n \
+          PAYLOAD=$(jq -n \
             --arg run_id "${RUN_ID:-}" \
-            --arg status "$([ -n '${{ steps.rules.outputs.degraded }}' ] && echo neutral || echo '${{ job.status }}')" \
-            --arg head_sha "${{ github.event.pull_request.head.sha }}" \
-            --arg workflow_run_id "${{ github.run_id }}" \
+            --arg run_token "${RUN_TOKEN:-}" \
+            --arg status "$STATUS" \
+            --arg head_sha "${HEAD_SHA:-}" \
+            --arg workflow_run_id "$WF_RUN_ID" \
             --arg ruleset_hash "$(cat .rules-hash 2>/dev/null || echo '')" \
-            --arg degraded "${{ steps.rules.outputs.degraded }}" \
-            --arg repo_full "${{ github.repository }}" \
-            --arg pr_number "${{ github.event.pull_request.number }}" \
-            --arg mode "${{ github.event_name == 'repository_dispatch' && 'sweep' || 'pr' }}" \
+            --arg degraded "${DEGRADED:-}" \
+            --arg repo_full "$REPO_FULL" \
+            --arg pr_number "${PR_NUMBER:-}" \
+            --arg mode "$RUN_MODE" \
             --argjson findings "$(jq -c '.findings // []' findings.json 2>/dev/null || echo '[]')" \
-            '{run_id: $run_id, status: $status, head_sha: $head_sha, mode: $mode,
+            '{run_id: $run_id, run_token: $run_token, status: $status,
+              head_sha: $head_sha, mode: $mode,
               repo_full_name: $repo_full,
               pr_number: (if $pr_number == "" then null else ($pr_number|tonumber) end),
               degraded_reason: (if $degraded == "" then null else $degraded end),
               workflow_run_id: $workflow_run_id,
               ruleset_hash: (if $ruleset_hash == "" then null else $ruleset_hash end),
-              findings: $findings}' > payload.json
-          # --fail-with-body ON PURPOSE: a rejected callback must turn the
-          # check red. Without it the job stayed green while the hub recorded
-          # nothing, which is how PR mode silently produced no data at all.
-          curl -sS --fail-with-body -X POST "$HUB_URL/api/code-review/webhook" \
-            -H "Authorization: Bearer $WEBHOOK_SECRET" \
-            -H "X-Run-Token: ${RUN_TOKEN:-}" \
-            -H 'Content-Type: application/json' \
-            --data @payload.json
+              findings: $findings}')
+          # A rejected callback must turn the check red: the job stayed green
+          # while the hub recorded nothing, which is how PR mode silently
+          # produced no data at all.
+          HTTP_CODE=$(send_webhook "$HUB_URL/api/code-review/webhook" "$WEBHOOK_SECRET" "$PAYLOAD" "/tmp/webhook_response.txt") || HTTP_CODE="failed"
+          echo "Webhook response: $HTTP_CODE"
+          cat /tmp/webhook_response.txt 2>/dev/null || true
+          case "$HTTP_CODE" in 2*) ;; *) echo "Hub rejected the callback"; exit 1;; esac
