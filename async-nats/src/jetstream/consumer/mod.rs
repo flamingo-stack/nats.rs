@@ -183,7 +183,7 @@ pub struct Info {
     /// The number of messages pending delivery
     pub num_pending: u64,
     /// Information about the consumer's cluster
-    #[serde(skip_serializing_if = "is_default")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<ClusterInfo>,
     /// Indicates if any client is connected and receiving messages from a push consumer
     #[serde(default, skip_serializing_if = "is_default")]
@@ -194,7 +194,7 @@ pub struct Info {
     pub paused: bool,
     #[cfg(feature = "server_2_11")]
     /// The remaining time the consumer is paused
-    #[serde(default, with = "serde_nanos")]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_nanos::option")]
     pub pause_remaining: Option<Duration>,
 }
 
