@@ -24,10 +24,10 @@ pub type DateTime = time::OffsetDateTime;
 
 #[derive(Serialize)]
 pub(crate) struct StreamMessageGetRequest {
-    #[serde(default, skip_serializing_if = "is_default")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
 
-    #[serde(default, rename = "last_by_subj", skip_serializing_if = "is_default")]
+    #[serde(default, rename = "last_by_subj", skip_serializing_if = "Option::is_none")]
     pub last_by_subject: Option<String>,
 }
 
@@ -84,7 +84,7 @@ impl TryFrom<RawStreamMessage> for StreamMessage {
 
     fn try_from(raw_message: RawStreamMessage) -> Result<StreamMessage, Self::Error> {
         let maybe_headers = if let Some(raw_headers) = raw_message.headers {
-            let decoded_headers = match base64::decode(raw_headers) {
+            let decoded_headers = match base64::engine::general_purpose::STANDARD.decode(raw_headers) {
                 Ok(data) => data,
                 Err(err) => return Err(io::Error::new(io::ErrorKind::Other, err)),
             };
@@ -96,7 +96,7 @@ impl TryFrom<RawStreamMessage> for StreamMessage {
             None
         };
 
-        let decoded_data = match base64::decode(&raw_message.data) {
+        let decoded_data = match base64::engine::general_purpose::STANDARD.decode(&raw_message.data) {
             Ok(data) => data,
             Err(err) => return Err(io::Error::new(io::ErrorKind::Other, err)),
         };
@@ -347,7 +347,7 @@ pub struct StreamConfig {
     /// How many Consumers can be defined for a given Stream, -1 for unlimited
     pub max_consumers: i32,
     /// Maximum age of any message in the stream, expressed in nanoseconds
-    #[serde(with = "serde_nanos")]
+    #[serde(default, with = "serde_nanos", skip_serializing_if = "is_default")]
     pub max_age: Duration,
     /// The largest message that will be accepted by the Stream
     #[serde(default, skip_serializing_if = "is_default")]
@@ -360,8 +360,8 @@ pub struct StreamConfig {
     #[serde(default, skip_serializing_if = "is_default")]
     pub no_ack: bool,
     /// The window within which to track duplicate messages.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub duplicate_window: i64,
+    #[serde(default, with = "serde_nanos", skip_serializing_if = "is_default")]
+    pub duplicate_window: Duration,
     /// The owner of the template associated with this stream.
     #[serde(default, skip_serializing_if = "is_default")]
     pub template_owner: String,
