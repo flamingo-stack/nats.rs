@@ -44,8 +44,10 @@ lazy_static! {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.inner.child.kill().unwrap();
-        self.inner.child.wait().unwrap();
+        // Use .ok() to avoid panicking in Drop, which would abort the process
+        // during stack unwinding and mask the original test failure.
+        self.inner.child.kill().ok();
+        self.inner.child.wait().ok();
         if let Ok(log) = fs::read_to_string(self.inner.logfile.as_os_str()) {
             // Check if we had JetStream running and if so cleanup the storage directory.
             if let Some(caps) = SD_RE.captures(&log) {
@@ -65,8 +67,8 @@ impl Server {
             .port
             .clone()
             .expect("can't restart server with dynamic port");
-        self.inner.child.kill().unwrap();
-        self.inner.child.wait().unwrap();
+        self.inner.child.kill().ok();
+        self.inner.child.wait().ok();
         let inner = do_run(&self.inner.cfg, Some(&port), Some(self.inner.id.clone()));
         self.inner = inner;
     }
@@ -78,7 +80,8 @@ impl Server {
         let mut r = BufReader::with_capacity(1024, TcpStream::connect(addr).unwrap());
         let mut line = String::new();
         r.read_line(&mut line).expect("did not receive INFO");
-        let si: Value = serde_json::from_str(&line["INFO".len()..]).expect("could not parse INFO");
+        // The NATS protocol sends "INFO <json>\r\n"; skip "INFO " (5 bytes including the space).
+        let si: Value = serde_json::from_str(&line["INFO ".len()..]).expect("could not parse INFO");
         let port = si["port"].as_u64().expect("could not parse port") as u16;
         let mut scheme = "nats://";
         if si["tls_required"].as_bool().unwrap_or(false) {
@@ -92,7 +95,8 @@ impl Server {
         let mut r = BufReader::with_capacity(1024, TcpStream::connect(addr).unwrap());
         let mut line = String::new();
         r.read_line(&mut line).expect("did not receive INFO");
-        let si: Value = serde_json::from_str(&line["INFO".len()..]).expect("could not parse INFO");
+        // The NATS protocol sends "INFO <json>\r\n"; skip "INFO " (5 bytes including the space).
+        let si: Value = serde_json::from_str(&line["INFO ".len()..]).expect("could not parse INFO");
         si["port"].as_u64().expect("could not parse port") as u16
     }
 
@@ -116,8 +120,13 @@ impl Server {
     // Grab client addr from logs.
     fn client_addr(&self) -> String {
         // We may need to wait for log to be present.
-        // Wait up to 10s. (100 * 100ms)
+        // Wait up to 50s. (100 * 500ms)
         for _ in 0..100 {
+            // Check if the child process has already exited (e.g. failed to start).
+            // If so, panic immediately rather than waiting the full timeout.
+            if let Ok(Some(status)) = self.inner.child.try_wait() {
+                panic!("nats-server process exited early with status: {status}");
+            }
             match fs::read_to_string(self.inner.logfile.as_os_str()) {
                 Ok(l) => {
                     if let Some(cre) = CLIENT_RE.captures(&l) {
@@ -184,6 +193,12 @@ pub fn run_cluster<'a, C: IntoConfig<'a>>(cfg: C) -> Cluster {
     let port = rand::thread_rng().gen_range(3000..50_000);
     let ports = [port, port + 100, port + 200];
 
+    // NOTE: There is an inherent TOCTOU race between is_port_available() and the
+    // nats-server process binding the port. In a heavily parallel CI environment
+    // this can still cause flaky failures. A robust fix would require holding the
+    // TcpListener open until the server spawns, or using port 0 and reading the
+    // actual port from the server's INFO message. The check below reduces (but
+    // does not eliminate) the race window.
     let ports = ports
         .iter()
         .map(|port| {
