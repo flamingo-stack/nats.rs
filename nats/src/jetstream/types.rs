@@ -330,31 +330,39 @@ pub struct StreamConfig {
     /// A name for the Stream. Must not have spaces, tabs or period `.` characters
     pub name: String,
     /// How large the Stream may become in total bytes before the configured discard policy kicks in
+    #[serde(default, skip_serializing_if = "is_default")]
     pub max_bytes: i64,
     /// How large the Stream may become in total messages before the configured discard policy kicks in
+    #[serde(default, skip_serializing_if = "is_default")]
     pub max_msgs: i64,
     /// Maximum amount of messages to keep per subject
+    #[serde(default, skip_serializing_if = "is_default")]
     pub max_msgs_per_subject: i64,
     /// When a Stream has reached its configured `max_bytes` or `max_msgs`, this policy kicks in.
     /// `DiscardPolicy::New` refuses new messages or `DiscardPolicy::Old` (default) deletes old messages to make space
+    #[serde(default, skip_serializing_if = "is_default")]
     pub discard: DiscardPolicy,
     /// Which NATS subjects to populate this stream with. Supports wildcards. Defaults to just the
     /// configured stream `name`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subjects: Vec<String>,
     /// How message retention is considered, `Limits` (default), `Interest` or `WorkQueue`
+    #[serde(default, skip_serializing_if = "is_default")]
     pub retention: RetentionPolicy,
     /// How many Consumers can be defined for a given Stream, -1 for unlimited
+    #[serde(default, skip_serializing_if = "is_default")]
     pub max_consumers: i32,
     /// Maximum age of any message in the stream, expressed in nanoseconds
-    #[serde(with = "serde_nanos")]
+    #[serde(with = "serde_nanos", default, skip_serializing_if = "is_default")]
     pub max_age: Duration,
     /// The largest message that will be accepted by the Stream
     #[serde(default, skip_serializing_if = "is_default")]
     pub max_msg_size: i32,
     /// The type of storage backend, `File` (default) and `Memory`
+    #[serde(default, skip_serializing_if = "is_default")]
     pub storage: StorageType,
     /// How many replicas to keep for each message in a clustered JetStream, maximum 5
+    #[serde(default, skip_serializing_if = "is_default")]
     pub num_replicas: usize,
     /// Disables acknowledging messages that are received by the Stream
     #[serde(default, skip_serializing_if = "is_default")]
