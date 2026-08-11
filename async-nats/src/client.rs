@@ -272,13 +272,13 @@ impl Client {
 
         let server_minor = server_version_captures
             .get(2)
-            .map(|m| m.as_str().parse::<i64>().unwrap())
-            .unwrap();
+            .and_then(|m| m.as_str().parse::<i64>().ok())
+            .unwrap_or(0);
 
         let server_patch = server_version_captures
             .get(3)
-            .map(|m| m.as_str().parse::<i64>().unwrap())
-            .unwrap();
+            .and_then(|m| m.as_str().parse::<i64>().ok())
+            .unwrap_or(0);
 
         if server_major < major
             || (server_major == major && server_minor < minor)
@@ -287,6 +287,21 @@ impl Client {
             return false;
         }
         true
+    }
+
+    fn check_max_payload(&self, payload: &Bytes) -> Result<(), PublishError> {
+        let max_payload = self.max_payload.load(Ordering::Relaxed);
+        if payload.len() > max_payload {
+            return Err(PublishError::with_source(
+                PublishErrorKind::MaxPayloadExceeded,
+                format!(
+                    "Payload size limit of {} exceeded by message size of {}",
+                    max_payload,
+                    payload.len(),
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Publish a [Message] to a given subject.
@@ -306,17 +321,7 @@ impl Client {
         payload: Bytes,
     ) -> Result<(), PublishError> {
         let subject = subject.to_subject();
-        let max_payload = self.max_payload.load(Ordering::Relaxed);
-        if payload.len() > max_payload {
-            return Err(PublishError::with_source(
-                PublishErrorKind::MaxPayloadExceeded,
-                format!(
-                    "Payload size limit of {} exceeded by message size of {}",
-                    max_payload,
-                    payload.len(),
-                ),
-            ));
-        }
+        self.check_max_payload(&payload)?;
 
         self.sender
             .send(Command::Publish(PublishMessage {
@@ -355,6 +360,7 @@ impl Client {
         payload: Bytes,
     ) -> Result<(), PublishError> {
         let subject = subject.to_subject();
+        self.check_max_payload(&payload)?;
 
         self.sender
             .send(Command::Publish(PublishMessage {
@@ -391,6 +397,7 @@ impl Client {
     ) -> Result<(), PublishError> {
         let subject = subject.to_subject();
         let reply = reply.to_subject();
+        self.check_max_payload(&payload)?;
 
         self.sender
             .send(Command::Publish(PublishMessage {
@@ -430,6 +437,7 @@ impl Client {
     ) -> Result<(), PublishError> {
         let subject = subject.to_subject();
         let reply = reply.to_subject();
+        self.check_max_payload(&payload)?;
 
         self.sender
             .send(Command::Publish(PublishMessage {
@@ -442,7 +450,7 @@ impl Client {
         Ok(())
     }
 
-    /// Sends the request with headers.
+    /// Sends a request to the given subject and awaits a reply.
     ///
     /// # Examples
     /// ```no_run
