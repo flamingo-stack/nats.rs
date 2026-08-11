@@ -35,6 +35,7 @@ struct Inner {
     child: Child,
     logfile: PathBuf,
     pidfile: PathBuf,
+    store_dir: Option<PathBuf>,
 }
 
 lazy_static! {
@@ -44,31 +45,35 @@ lazy_static! {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.inner.child.kill().unwrap();
-        self.inner.child.wait().unwrap();
-        if let Ok(log) = fs::read_to_string(self.inner.logfile.as_os_str()) {
+        self.inner.child.kill().ok();
+        self.inner.child.wait().ok();
+        // If we have an explicit store_dir stored, remove it directly.
+        if let Some(ref sd) = self.inner.store_dir {
+            fs::remove_dir_all(sd).ok();
+        } else if let Ok(log) = fs::read_to_string(self.inner.logfile.as_os_str()) {
             // Check if we had JetStream running and if so cleanup the storage directory.
             if let Some(caps) = SD_RE.captures(&log) {
                 let sd = caps.get(1).map_or("", |m| m.as_str());
                 fs::remove_dir_all(sd).ok();
             }
-            // Remove Logfile.
-            fs::remove_file(self.inner.logfile.as_os_str()).ok();
         }
+        // Remove Logfile.
+        fs::remove_file(self.inner.logfile.as_os_str()).ok();
     }
 }
 
 impl Server {
-    pub fn restart(&mut self) {
+    pub fn restart(&mut self) -> Result<(), &'static str> {
         let port = self
             .inner
             .port
             .clone()
-            .expect("can't restart server with dynamic port");
-        self.inner.child.kill().unwrap();
-        self.inner.child.wait().unwrap();
+            .ok_or("can't restart server with dynamic port")?;
+        self.inner.child.kill().ok();
+        self.inner.child.wait().ok();
         let inner = do_run(&self.inner.cfg, Some(&port), Some(self.inner.id.clone()));
         self.inner = inner;
+        Ok(())
     }
 
     // Grab client url.
@@ -116,7 +121,7 @@ impl Server {
     // Grab client addr from logs.
     fn client_addr(&self) -> String {
         // We may need to wait for log to be present.
-        // Wait up to 10s. (100 * 100ms)
+        // Wait up to 50s. (100 * 500ms)
         for _ in 0..100 {
             match fs::read_to_string(self.inner.logfile.as_os_str()) {
                 Ok(l) => {
@@ -188,13 +193,15 @@ pub fn run_cluster<'a, C: IntoConfig<'a>>(cfg: C) -> Cluster {
         .iter()
         .map(|port| {
             let mut new_port = *port;
+            // Check both the client port and the cluster port (client+1) for availability.
             while !is_port_available(new_port) || !is_port_available(new_port + 1) {
                 new_port = rand::thread_rng().gen_range(2000..50_000);
             }
             new_port
         })
         .collect::<Vec<usize>>();
-    let cluster = [port + 1, port + 101, port + 201];
+    // Cluster ports are client_port+1 for each node; availability was verified above.
+    let cluster = [ports[0] + 1, ports[1] + 1, ports[2] + 1];
 
     let s1 = run_cluster_node_with_port(
         cfg.0[0],
@@ -231,7 +238,7 @@ pub struct Cluster {
 
 impl Cluster {
     pub fn client_url(&self) -> String {
-        self.servers[0].client_url()
+        self.servers.iter().map(|s| s.client_url()).collect::<Vec<_>>().join(",")
     }
 }
 
@@ -275,6 +282,7 @@ fn do_run(cfg: &str, port: Option<&str>, id: Option<String>) -> Inner {
         child,
         logfile,
         pidfile,
+        store_dir: None,
     }
 }
 
@@ -334,6 +342,7 @@ fn run_cluster_node_with_port(
             child,
             logfile,
             pidfile,
+            store_dir: Some(store_dir),
         },
     }
 }
