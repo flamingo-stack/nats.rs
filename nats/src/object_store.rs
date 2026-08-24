@@ -326,6 +326,11 @@ impl io::Read for Object {
                     }
                 }
                 return Ok(len);
+            } else {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "subscription ended before all pending chunks were received",
+                ));
             }
         }
 
