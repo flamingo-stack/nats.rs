@@ -76,3 +76,19 @@ mod websockets {
         assert_eq!(sub.next().await.unwrap().payload, "hello");
     }
 }
+
+/// Handshake header values are credentials. They must never reach a log, and `Debug` on
+/// `ConnectOptions` is the sink most likely to be hit by accident.
+#[test]
+fn debug_does_not_render_handshake_header_values() {
+    let options = async_nats::ConnectOptions::new()
+        .custom_header("x-machine-id", "machine-123")
+        .custom_header("Authorization", "Bearer super-secret-token");
+
+    let rendered = format!("{options:?}");
+
+    assert!(rendered.contains("handshake_headers"), "{rendered}");
+    assert!(rendered.contains("Authorization"), "{rendered}");
+    assert!(!rendered.contains("super-secret-token"), "{rendered}");
+    assert!(!rendered.contains("machine-123"), "{rendered}");
+}
