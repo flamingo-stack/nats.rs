@@ -18,6 +18,7 @@ use crate::connection::State;
 #[cfg(feature = "websockets")]
 use crate::connection::WebSocketAdapter;
 use crate::options::CallbackArg1;
+use crate::options::HandshakeHeaderValue;
 use crate::tls;
 use crate::AuthError;
 use crate::ClientError;
@@ -68,11 +69,10 @@ pub(crate) struct ConnectorOptions {
     pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
     pub(crate) auth_url_callback: Option<CallbackArg1<(), Result<String, AuthError>>>,
-    pub(crate) max_reconnects: Option<usize>,
-    /// Custom headers to be sent during WebSocket handshake.
-    /// Only used when the `websockets` feature is enabled.
+    /// Custom headers for the WebSocket handshake, resolved per connect attempt.
     #[cfg_attr(not(feature = "websockets"), allow(dead_code))]
-    pub(crate) handshake_headers: HashMap<String, String>,
+    pub(crate) handshake_headers: HashMap<String, HandshakeHeaderValue>,
+    pub(crate) max_reconnects: Option<usize>,
 }
 
 /// Maintains a list of servers and establishes connections.
@@ -469,6 +469,54 @@ impl Connector {
         Err(error.unwrap())
     }
 
+    /// Resolves the handshake headers for one connect attempt.
+    ///
+    /// Providers are called here, on every attempt, so a credential that rotated since the last
+    /// connect is used by this one.
+    #[cfg(feature = "websockets")]
+    async fn resolve_handshake_headers(
+        &self,
+    ) -> Vec<(http::header::HeaderName, http::header::HeaderValue)> {
+        let mut resolved = Vec::with_capacity(self.options.handshake_headers.len());
+        for (name, source) in &self.options.handshake_headers {
+            let value = match source {
+                HandshakeHeaderValue::Static(value) => value.clone(),
+                HandshakeHeaderValue::Provider(provider) => {
+                    // Bounded: this runs inline on the connection handler, so a provider that
+                    // never returns would stop the client reconnecting at all.
+                    match tokio::time::timeout(self.options.connection_timeout, provider.call(()))
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(_) => {
+                            tracing::warn!(
+                                header_name = %name,
+                                "custom handshake header provider timed out, skipping"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            // A provider yields an empty value when it has nothing to offer this attempt; a
+            // static empty value is sent, as it was before providers existed.
+            if value.is_empty() && matches!(source, HandshakeHeaderValue::Provider(_)) {
+                continue;
+            }
+            match (
+                http::header::HeaderName::try_from(name.as_str()),
+                http::header::HeaderValue::try_from(value.as_str()),
+            ) {
+                (Ok(name), Ok(value)) => resolved.push((name, value)),
+                _ => tracing::warn!(
+                    header_name = %name,
+                    "failed to parse custom handshake header, skipping"
+                ),
+            }
+        }
+        resolved
+    }
+
     pub(crate) async fn try_connect_to(
         &self,
         socket_addr: &SocketAddr,
@@ -492,26 +540,10 @@ impl Connector {
                     .map_err(|err| {
                         ConnectError::with_source(crate::ConnectErrorKind::ServerParse, err)
                     })?;
-
-                // Add custom handshake headers
-                for (name, value) in &self.options.handshake_headers {
-                    if let (Ok(header_name), Ok(header_value)) = (
-                        http::header::HeaderName::try_from(name.as_str()),
-                        http::header::HeaderValue::try_from(value.as_str()),
-                    ) {
-                        ws_builder = ws_builder.add_header(header_name, header_value);
-                    } else {
-                        tracing::warn!(
-                            header_name = %name,
-                            "failed to parse custom handshake header, skipping"
-                        );
-                    }
+                for (name, value) in self.resolve_handshake_headers().await {
+                    ws_builder = ws_builder.add_header(name, value);
                 }
-
-                let ws = tokio::time::timeout(
-                    self.options.connection_timeout,
-                    ws_builder.connect(),
-                )
+                let ws = tokio::time::timeout(self.options.connection_timeout, ws_builder.connect())
                 .await
                 .map_err(|_| ConnectError::new(crate::ConnectErrorKind::TimedOut))?
                 .map_err(|err| {
@@ -545,26 +577,10 @@ impl Connector {
                     .map_err(|err| {
                         ConnectError::with_source(crate::ConnectErrorKind::ServerParse, err)
                     })?;
-
-                // Add custom handshake headers
-                for (name, value) in &self.options.handshake_headers {
-                    if let (Ok(header_name), Ok(header_value)) = (
-                        http::header::HeaderName::try_from(name.as_str()),
-                        http::header::HeaderValue::try_from(value.as_str()),
-                    ) {
-                        ws_builder = ws_builder.add_header(header_name, header_value);
-                    } else {
-                        tracing::warn!(
-                            header_name = %name,
-                            "failed to parse custom handshake header, skipping"
-                        );
-                    }
+                for (name, value) in self.resolve_handshake_headers().await {
+                    ws_builder = ws_builder.add_header(name, value);
                 }
-
-                let ws = tokio::time::timeout(
-                    self.options.connection_timeout,
-                    ws_builder.connect(),
-                )
+                let ws = tokio::time::timeout(self.options.connection_timeout, ws_builder.connect())
                 .await
                 .map_err(|_| ConnectError::new(crate::ConnectErrorKind::TimedOut))?
                 .map_err(|err| {

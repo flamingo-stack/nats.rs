@@ -17,9 +17,9 @@ use crate::{Client, ConnectError, Event, ToServerAddrs};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::engine::Engine;
 use futures_util::Future;
-use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::{
+    collections::HashMap,
     fmt,
     path::{Path, PathBuf},
     pin::Pin,
@@ -67,8 +67,17 @@ pub struct ConnectOptions {
     pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
     pub(crate) auth_url_callback: Option<CallbackArg1<(), Result<String, AuthError>>>,
-    /// Custom headers to be sent during WebSocket handshake.
-    pub(crate) handshake_headers: HashMap<String, String>,
+    pub(crate) handshake_headers: HashMap<String, HandshakeHeaderValue>,
+}
+
+/// Where the value of a WebSocket handshake header comes from.
+#[cfg_attr(not(feature = "websockets"), allow(dead_code))]
+pub(crate) enum HandshakeHeaderValue {
+    /// Fixed for the lifetime of the client.
+    Static(String),
+    /// Resolved on every connect attempt, so a rotated credential is picked up
+    /// by the next reconnect without rebuilding the client.
+    Provider(CallbackArg1<(), String>),
 }
 
 impl fmt::Debug for ConnectOptions {
@@ -89,7 +98,10 @@ impl fmt::Debug for ConnectOptions {
             .entry(&"inbox_prefix", &self.inbox_prefix)
             .entry(&"retry_on_initial_connect", &self.retry_on_initial_connect)
             .entry(&"read_buffer_capacity", &self.read_buffer_capacity)
-            .entry(&"handshake_headers", &self.handshake_headers.keys().collect::<Vec<_>>())
+            .entry(
+                &"handshake_headers",
+                &self.handshake_headers.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -946,8 +958,10 @@ impl ConnectOptions {
         self
     }
 
-    /// Adds a custom HTTP header to be sent during WebSocket handshake.
-    /// This is only used when connecting via WebSocket (`ws://` or `wss://` schemes).
+    /// Adds a fixed HTTP header to the WebSocket handshake (`ws://` / `wss://` only).
+    ///
+    /// The value is captured once. For a credential that rotates during the lifetime of the
+    /// client, use [`ConnectOptions::custom_header_provider`] instead.
     ///
     /// # Example
     /// ```no_run
@@ -955,7 +969,6 @@ impl ConnectOptions {
     /// # async fn main() -> Result<(), async_nats::ConnectError> {
     /// async_nats::ConnectOptions::new()
     ///     .custom_header("x-machine-id", "my-machine-123")
-    ///     .custom_header("x-tenant-id", "tenant-456")
     ///     .connect("ws://demo.nats.io")
     ///     .await?;
     /// # Ok(())
@@ -966,7 +979,51 @@ impl ConnectOptions {
         K: ToString,
         V: ToString,
     {
-        self.handshake_headers.insert(name.to_string(), value.to_string());
+        self.handshake_headers.insert(
+            name.to_string(),
+            HandshakeHeaderValue::Static(value.to_string()),
+        );
+        self
+    }
+
+    /// Adds a WebSocket handshake header whose value is resolved on **every** connect attempt.
+    ///
+    /// This is how a rotating credential belongs in a handshake header. A bearer token in the
+    /// connect URL is copied verbatim into every access log that records the request line; a
+    /// header reaches none of those sinks. Because the provider is called per attempt, a token
+    /// that rotates while the client is connected is picked up by the next reconnect on its own —
+    /// no rebuilding the client, no draining subscriptions.
+    ///
+    /// Returning an empty string skips the header for that attempt, and the provider is
+    /// bounded by `connection_timeout` so a stuck one cannot stop the client reconnecting.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// # let token_store = std::sync::Arc::new(String::new());
+    /// async_nats::ConnectOptions::new()
+    ///     .custom_header_provider("Authorization", move || {
+    ///         let token_store = token_store.clone();
+    ///         async move { format!("Bearer {token_store}") }
+    ///     })
+    ///     .connect("wss://demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn custom_header_provider<K, F, Fut>(mut self, name: K, provider: F) -> ConnectOptions
+    where
+        K: ToString,
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = String> + 'static + Send + Sync,
+    {
+        self.handshake_headers.insert(
+            name.to_string(),
+            HandshakeHeaderValue::Provider(CallbackArg1::<(), String>(Box::new(move |()| {
+                Box::pin(provider())
+            }))),
+        );
         self
     }
 }
