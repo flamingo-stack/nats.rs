@@ -56,13 +56,15 @@ mod object_store {
         let mut result = Vec::new();
         loop {
             let mut buffer = [0; 1024];
-            if let Ok(n) = object.read(&mut buffer).await {
-                if n == 0 {
+            match object.read(&mut buffer).await {
+                Ok(0) => {
                     println!("finished");
                     break;
                 }
-
-                result.extend_from_slice(&buffer[..n]);
+                Ok(n) => {
+                    result.extend_from_slice(&buffer[..n]);
+                }
+                Err(err) => panic!("failed reading object: {err}"),
             }
         }
         assert_eq!(
