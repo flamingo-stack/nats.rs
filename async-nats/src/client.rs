@@ -265,20 +265,29 @@ impl Client {
             None => return false,
         };
 
-        let server_major = server_version_captures
+        let server_major = match server_version_captures
             .get(1)
-            .map(|m| m.as_str().parse::<i64>().unwrap())
-            .unwrap();
+            .and_then(|m| m.as_str().parse::<i64>().ok())
+        {
+            Some(v) => v,
+            None => return false,
+        };
 
-        let server_minor = server_version_captures
+        let server_minor = match server_version_captures
             .get(2)
-            .map(|m| m.as_str().parse::<i64>().unwrap())
-            .unwrap();
+            .map_or(Some(0), |m| m.as_str().parse::<i64>().ok())
+        {
+            Some(v) => v,
+            None => return false,
+        };
 
-        let server_patch = server_version_captures
+        let server_patch = match server_version_captures
             .get(3)
-            .map(|m| m.as_str().parse::<i64>().unwrap())
-            .unwrap();
+            .map_or(Some(0), |m| m.as_str().parse::<i64>().ok())
+        {
+            Some(v) => v,
+            None => return false,
+        };
 
         if server_major < major
             || (server_major == major && server_minor < minor)

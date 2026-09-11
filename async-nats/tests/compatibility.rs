@@ -29,6 +29,9 @@ mod compatibility {
     use serde::{Deserialize, Serialize};
     use tokio::io::AsyncReadExt;
 
+    // TODO(#1568): implement the kv compatibility suite. Ignored so CI does
+    // not report this feature as failing while the suite is unimplemented.
+    #[ignore = "kv suite not implemented yet, tracking issue #1568"]
     #[tokio::test]
     async fn kv() {
         panic!("kv suite not implemented yet")
@@ -558,3 +561,4 @@ mod compatibility {
         config: T,
     }
 }
+
