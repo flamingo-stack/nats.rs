@@ -24,10 +24,10 @@ pub type DateTime = time::OffsetDateTime;
 
 #[derive(Serialize)]
 pub(crate) struct StreamMessageGetRequest {
-    #[serde(default, skip_serializing_if = "is_default")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
 
-    #[serde(default, rename = "last_by_subj", skip_serializing_if = "is_default")]
+    #[serde(default, rename = "last_by_subj", skip_serializing_if = "Option::is_none")]
     pub last_by_subject: Option<String>,
 }
 
@@ -84,6 +84,10 @@ impl TryFrom<RawStreamMessage> for StreamMessage {
 
     fn try_from(raw_message: RawStreamMessage) -> Result<StreamMessage, Self::Error> {
         let maybe_headers = if let Some(raw_headers) = raw_message.headers {
+            // NOTE: base64 v0.13 `decode` uses the standard alphabet. JetStream
+            // may encode some payloads with the URL-safe alphabet; if decoding
+            // fails or produces wrong bytes, upgrade the `base64` dependency to
+            // v0.21+ and use `base64::engine::general_purpose::STANDARD.decode`.
             let decoded_headers = match base64::decode(raw_headers) {
                 Ok(data) => data,
                 Err(err) => return Err(io::Error::new(io::ErrorKind::Other, err)),
@@ -96,6 +100,7 @@ impl TryFrom<RawStreamMessage> for StreamMessage {
             None
         };
 
+        // NOTE: same base64 v0.13 caveat as above applies here.
         let decoded_data = match base64::decode(&raw_message.data) {
             Ok(data) => data,
             Err(err) => return Err(io::Error::new(io::ErrorKind::Other, err)),
@@ -330,10 +335,13 @@ pub struct StreamConfig {
     /// A name for the Stream. Must not have spaces, tabs or period `.` characters
     pub name: String,
     /// How large the Stream may become in total bytes before the configured discard policy kicks in
+    #[serde(default, skip_serializing_if = "is_default")]
     pub max_bytes: i64,
     /// How large the Stream may become in total messages before the configured discard policy kicks in
+    #[serde(default, skip_serializing_if = "is_default")]
     pub max_msgs: i64,
     /// Maximum amount of messages to keep per subject
+    #[serde(default, skip_serializing_if = "is_default")]
     pub max_msgs_per_subject: i64,
     /// When a Stream has reached its configured `max_bytes` or `max_msgs`, this policy kicks in.
     /// `DiscardPolicy::New` refuses new messages or `DiscardPolicy::Old` (default) deletes old messages to make space
@@ -345,9 +353,10 @@ pub struct StreamConfig {
     /// How message retention is considered, `Limits` (default), `Interest` or `WorkQueue`
     pub retention: RetentionPolicy,
     /// How many Consumers can be defined for a given Stream, -1 for unlimited
+    #[serde(default, skip_serializing_if = "is_default")]
     pub max_consumers: i32,
     /// Maximum age of any message in the stream, expressed in nanoseconds
-    #[serde(with = "serde_nanos")]
+    #[serde(with = "serde_nanos", skip_serializing_if = "is_default")]
     pub max_age: Duration,
     /// The largest message that will be accepted by the Stream
     #[serde(default, skip_serializing_if = "is_default")]
