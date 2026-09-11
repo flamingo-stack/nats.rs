@@ -39,11 +39,22 @@ jobs:
 
           git checkout -B "$BRANCH" origin/main
           if ! git merge --no-ff --no-edit upstream/main; then
-            echo "::notice::merge has conflicts — skipping, will retry next run"
-            exit 0
+            echo "::error::merge has conflicts — aborting sync, will retry next run"
+            git merge --abort
+            exit 1
           fi
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            if ! git merge-base --is-ancestor "origin/$BRANCH" "$BRANCH"; then
+              echo "::error::remote $BRANCH has diverged (manual changes present) — refusing to force-push"
+              exit 1
+            fi
+          fi
+
           git push -f origin "$BRANCH"
 
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
             --title "Sync from Fork" \
             --body "Automatic weekly sync from \`nats-io/nats.rs@main\`."
+
