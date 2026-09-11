@@ -15,20 +15,44 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-impl std::error::Error for Error {}
+/// Error kind describing a service request error payload.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ErrorKind {
+    /// The service returned an error response with the given status and code.
+    Request,
+}
+
+impl Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErrorKind::Request => write!(f, "service request error"),
+        }
+    }
+}
+
+/// Error returned when a service request fails.
+pub type Error = crate::error::Error<ErrorKind>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct Error {
+pub struct ErrorPayload {
     pub status: String,
     pub code: usize,
 }
 
-impl Display for Error {
+impl Display for ErrorPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "service request error code: {}, status: {}",
             self.status, self.code
         )
+    }
+}
+
+impl std::error::Error for ErrorPayload {}
+
+impl From<ErrorPayload> for Error {
+    fn from(payload: ErrorPayload) -> Self {
+        Error::with_source(ErrorKind::Request, payload.to_string(), payload)
     }
 }
