@@ -380,6 +380,10 @@ impl Service {
                 loop {
                     tokio::select! {
                         Some(ping) = pings.next() => {
+                            let Some(reply) = ping.reply else {
+                                debug!("ignoring PING request without a reply subject");
+                                continue;
+                            };
                             let pong = serde_json::to_vec(&PingResponse{
                                 kind: "io.nats.micro.v1.ping_response".to_string(),
                                 name: info.name.clone(),
@@ -387,9 +391,13 @@ impl Service {
                                 version: info.version.clone(),
                                 metadata: info.metadata.clone(),
                             })?;
-                            client.publish(ping.reply.unwrap(), pong.into()).await?;
+                            client.publish(reply, pong.into()).await?;
                         },
                         Some(info_request) = infos.next() => {
+                            let Some(reply) = info_request.reply else {
+                                debug!("ignoring INFO request without a reply subject");
+                                continue;
+                            };
                             let info = info.clone();
 
                             let endpoints: Vec<endpoint::Info> = {
@@ -407,9 +415,13 @@ impl Service {
                                 ..info
                             };
                             let info_json = serde_json::to_vec(&info).map(Bytes::from)?;
-                            client.publish(info_request.reply.unwrap(), info_json.clone()).await?;
+                            client.publish(reply, info_json.clone()).await?;
                         },
                         Some(stats_request) = stats.next() => {
+                            let Some(reply) = stats_request.reply else {
+                                debug!("ignoring STATS request without a reply subject");
+                                continue;
+                            };
                             if let Some(stats_callback) = stats_callback.as_mut() {
                                 let mut endpoint_stats_locked = endpoints_state.lock().unwrap();
                                 for (key, value) in &mut endpoint_stats_locked.endpoints {
@@ -425,7 +437,7 @@ impl Service {
                                 started,
                                 endpoints: endpoints_state.lock().unwrap().endpoints.values().cloned().map(Into::into).collect(),
                             })?;
-                            client.publish(stats_request.reply.unwrap(), stats.into()).await?;
+                            client.publish(reply, stats.into()).await?;
                         },
                         else => break,
                     }
