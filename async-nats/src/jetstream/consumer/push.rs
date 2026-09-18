@@ -153,10 +153,12 @@ impl futures_util::Stream for Messages {
                                     // TODO store pending_publish as a future and return errors from it
                                     let client = self.context.client.clone();
                                     tokio::task::spawn(async move {
-                                        client
+                                        if let Err(err) = client
                                             .publish(subject, Bytes::from_static(b""))
                                             .await
-                                            .unwrap();
+                                        {
+                                            debug!("failed to send heartbeat reply: {}", err);
+                                        }
                                     });
                                 }
 

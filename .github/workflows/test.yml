@@ -62,7 +62,7 @@ jobs:
           cargo build --all-targets
 
       - name: Setup deno for service tests
-        if: ${{ matrix.os }} != windows-latest
+        if: matrix.os != 'windows-latest'
         uses: denoland/setup-deno@v1
         with:
           deno-version: v1.x
@@ -279,3 +279,4 @@ jobs:
           RUST_BACKTRACE: 1
         # cannot check against all packages because min versions of nats@0.16.0 are broken
         run: cargo +${{ steps.install-stable-rust.outputs.name }} check --package async-nats --locked --all-features --all-targets
+
