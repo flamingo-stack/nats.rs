@@ -46,7 +46,7 @@ jobs:
         with:
           go-version: '1.22'
       - name: Install nats-server
-        run:  go install github.com/nats-io/nats-server/v2@main
+        run:  go install github.com/nats-io/nats-server/v2@v2.10.24
       - name: Install stable Rust on ${{ matrix.os }}
         id:   install-rust
         uses: dtolnay/rust-toolchain@stable
@@ -95,9 +95,7 @@ jobs:
         run: cargo fmt -- --check
 
   check_lint:
-    defaults:
-      run:
-        working-directory: ./async-nats
+    needs: [test_matrix]
     name: check linter (ubuntu-latest / stable)
     runs-on: ubuntu-latest
     steps:
@@ -116,7 +114,7 @@ jobs:
           save-if: false # the linter only run checks but not builds, so we don't have the full build to be cached.
 
       - name: Run linter
-        run: cargo clippy --benches --tests --examples --all-features  -- --deny clippy::all
+        run: cargo clippy --workspace --benches --tests --examples --all-features -- --deny clippy::all
 
   check_docs:
     defaults:
