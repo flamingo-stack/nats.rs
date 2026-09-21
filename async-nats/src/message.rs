@@ -36,5 +36,7 @@ pub struct Message {
     /// Optional [status][crate::Message::status] description.
     pub description: Option<String>,
 
+    /// The wire-encoded length of the message payload, as reported by the server.
     pub length: usize,
 }
+
