@@ -409,13 +409,31 @@ impl Client {
 
         match parts.next().unwrap() {
             "PONG" => {
-                assert!(self.outstanding_pings > 0);
+                if self.outstanding_pings == 0 {
+                    log::debug!(
+                        "{}: received PONG with no outstanding ping, evicting",
+                        self.client_id
+                    );
+                    return ClientAction::Evict;
+                }
                 self.outstanding_pings -= 1;
-                assert_eq!(parts.next(), None);
+                if parts.next().is_some() {
+                    log::debug!(
+                        "{}: received PONG with trailing tokens, evicting",
+                        self.client_id
+                    );
+                    return ClientAction::Evict;
+                }
                 ClientAction::None
             }
             "PING" => {
-                assert_eq!(parts.next(), None);
+                if parts.next().is_some() {
+                    log::debug!(
+                        "{}: received PING with trailing tokens, evicting",
+                        self.client_id
+                    );
+                    return ClientAction::Evict;
+                }
                 if self.socket.write_all(b"PONG\r\n").is_err() {
                     return ClientAction::Evict;
                 }
@@ -428,14 +446,43 @@ impl Client {
                 ClientAction::None
             }
             "CONNECT" => {
-                let _: ConnectInfo = serde_json::from_str(parts.next().unwrap()).unwrap();
-                assert_eq!(parts.next(), None);
+                let connect_arg = if let Some(connect_arg) = parts.next() {
+                    connect_arg
+                } else {
+                    log::debug!("{}: received CONNECT with no argument, evicting", self.client_id);
+                    return ClientAction::Evict;
+                };
+                if serde_json::from_str::<ConnectInfo>(connect_arg).is_err() {
+                    log::debug!(
+                        "{}: received CONNECT with invalid JSON, evicting",
+                        self.client_id
+                    );
+                    return ClientAction::Evict;
+                }
+                if parts.next().is_some() {
+                    log::debug!(
+                        "{}: received CONNECT with trailing tokens, evicting",
+                        self.client_id
+                    );
+                    return ClientAction::Evict;
+                }
                 ClientAction::None
             }
             "SUB" => {
-                let subject = parts.next().unwrap();
-                let sid = parts.next().unwrap();
-                assert_eq!(parts.next(), None);
+                let (subject, sid) = match (parts.next(), parts.next()) {
+                    (Some(subject), Some(sid)) => (subject, sid),
+                    _ => {
+                        log::debug!("{}: received malformed SUB, evicting", self.client_id);
+                        return ClientAction::Evict;
+                    }
+                };
+                if parts.next().is_some() {
+                    log::debug!(
+                        "{}: received SUB with trailing tokens, evicting",
+                        self.client_id
+                    );
+                    return ClientAction::Evict;
+                }
                 let entry = self.subs.entry(subject.to_string()).or_default();
                 entry.insert(sid.to_string());
                 ClientAction::None
@@ -444,10 +491,19 @@ impl Client {
                 let (subject, reply, len) = match (parts.next(), parts.next(), parts.next()) {
                     (Some(subject), Some(reply), Some(len)) => (subject, Some(reply), len),
                     (Some(subject), Some(len), None) => (subject, None, len),
-                    other => panic!("unknown args: {:?}", other),
+                    _ => {
+                        log::debug!("{}: received malformed PUB, evicting", self.client_id);
+                        return ClientAction::Evict;
+                    }
                 };
 
-                assert_eq!(parts.next(), None);
+                if parts.next().is_some() {
+                    log::debug!(
+                        "{}: received PUB with trailing tokens, evicting",
+                        self.client_id
+                    );
+                    return ClientAction::Evict;
+                }
 
                 let next_line = if let Some(next_line) = read_line(&mut self.socket) {
                     next_line
@@ -472,12 +528,26 @@ impl Client {
                 }
             }
             "UNSUB" => {
-                let sid = parts.next().unwrap();
-                assert_eq!(parts.next(), None);
+                let sid = if let Some(sid) = parts.next() {
+                    sid
+                } else {
+                    log::debug!("{}: received malformed UNSUB, evicting", self.client_id);
+                    return ClientAction::Evict;
+                };
+                if parts.next().is_some() {
+                    log::debug!(
+                        "{}: received UNSUB with trailing tokens, evicting",
+                        self.client_id
+                    );
+                    return ClientAction::Evict;
+                }
                 self.subs.remove(sid);
                 ClientAction::None
             }
-            other => panic!("unknown command {}", other),
+            other => {
+                log::debug!("{}: received unknown command {}, evicting", self.client_id, other);
+                ClientAction::Evict
+            }
         }
     }
 }

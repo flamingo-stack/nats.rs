@@ -220,21 +220,21 @@ impl PullSubscription {
         F: FnMut(&Message) -> io::Result<()>,
         I: Into<BatchOptions> + Copy,
     {
-        let mut last_message;
+        let mut last_message = None;
         let consumer_ack_policy = self.0.consumer_ack_policy;
         let batch = self.fetch(batch)?;
         for message in batch {
             handler(&message)?;
-            if consumer_ack_policy != AckPolicy::None {
+            if consumer_ack_policy != AckPolicy::None && consumer_ack_policy != AckPolicy::All {
                 message.ack()?
             }
             last_message = Some(message);
-            // if the policy is ack all - optimize and send the ack
-            // after the last message was processed.
-            if consumer_ack_policy == AckPolicy::All {
-                if let Some(last_message) = last_message {
-                    last_message.ack()?;
-                }
+        }
+        // if the policy is ack all - optimize and send the ack
+        // after the last message was processed.
+        if consumer_ack_policy == AckPolicy::All {
+            if let Some(last_message) = last_message {
+                last_message.ack()?;
             }
         }
         Ok(())

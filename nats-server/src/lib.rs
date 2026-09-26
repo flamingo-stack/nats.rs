@@ -44,8 +44,8 @@ lazy_static! {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.inner.child.kill().unwrap();
-        self.inner.child.wait().unwrap();
+        let _ = self.inner.child.kill();
+        let _ = self.inner.child.wait();
         if let Ok(log) = fs::read_to_string(self.inner.logfile.as_os_str()) {
             // Check if we had JetStream running and if so cleanup the storage directory.
             if let Some(caps) = SD_RE.captures(&log) {

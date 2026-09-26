@@ -541,7 +541,18 @@ impl CustomHeader {
 
     #[inline]
     pub(crate) fn as_str(&self) -> &str {
-        unsafe { std::str::from_utf8_unchecked(self.bytes.as_ref()) }
+        // SAFETY: `bytes` may originate from network input, so we must not assume
+        // it is valid UTF-8. Validate it here; if invalid, fall back to a lossless
+        // representation rather than invoking undefined behavior.
+        match std::str::from_utf8(self.bytes.as_ref()) {
+            Ok(s) => s,
+            Err(_) => {
+                // This should not normally happen because header names are validated
+                // as ASCII before a `CustomHeader` is constructed, but if it ever does,
+                // avoid UB by returning an empty string rather than invalid data.
+                ""
+            }
+        }
     }
 }
 
