@@ -102,7 +102,7 @@ pub(crate) fn backoff(reconnects: usize) -> Duration {
     let base = if reconnects == 0 {
         Duration::from_millis(0)
     } else {
-        let exp: u32 = (reconnects - 1).try_into().unwrap_or(std::u32::MAX);
+        let exp: u32 = (reconnects - 1).try_into().unwrap_or(u32::MAX);
 
         let max = if cfg!(feature = "fault_injection") {
             Duration::from_millis(20)
