@@ -28,6 +28,11 @@ use time::OffsetDateTime;
 
 pub(crate) const MESSAGE_NOT_BOUND: &str = "message not bound to a connection";
 
+/// Maximum number of retries for `Message::double_ack` before giving up
+/// and returning an error to the caller. This bounds the otherwise
+/// blocking retry loop so a caller's thread cannot hang forever.
+const DOUBLE_ACK_MAX_RETRIES: usize = 10;
+
 /// A message received on a subject.
 #[derive(Clone)]
 pub struct Message {
@@ -207,6 +212,11 @@ impl Message {
     /// See `AckKind` documentation for details of what each variant means.
     ///
     /// Returns immediately if this message has already been double-acked.
+    ///
+    /// Retries are bounded: if the server connection cannot be reestablished
+    /// and the ack is never confirmed within `DOUBLE_ACK_MAX_RETRIES`
+    /// attempts, this returns a `TimedOut` error rather than blocking the
+    /// calling thread forever.
     pub fn double_ack(&self, ack_kind: crate::jetstream::AckKind) -> io::Result<()> {
         if self.double_acked.load(Ordering::Acquire) {
             return Ok(());
@@ -230,6 +240,15 @@ impl Message {
             retries += 1;
             if retries == 2 {
                 log::warn!("double_ack is retrying until the server connection is reestablished");
+            }
+            if retries > DOUBLE_ACK_MAX_RETRIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "double_ack did not receive server confirmation after {} retries",
+                        DOUBLE_ACK_MAX_RETRIES
+                    ),
+                ));
             }
             let ack_reply = format!("_INBOX.{}", nuid::next());
             let sub_ret = client.subscribe(&ack_reply, None);
@@ -258,18 +277,26 @@ impl Message {
 
     /// Returns the `JetStream` message ID
     /// if this is a `JetStream` message.
-    /// Returns `None` if this is not
+    /// Returns `Ok(None)` if this is not
     /// a `JetStream` message with headers
-    /// set.
+    /// set. Returns `Err` if the reply subject
+    /// looked like a JetStream ACK reply but
+    /// failed to parse, which likely indicates
+    /// a version mismatch with the nats-server.
     #[allow(clippy::mixed_read_write_in_expression)]
-    pub fn jetstream_message_info(&self) -> Option<crate::jetstream::JetStreamMessageInfo<'_>> {
+    pub fn jetstream_message_info(
+        &self,
+    ) -> Result<Option<crate::jetstream::JetStreamMessageInfo<'_>>, io::Error> {
         const PREFIX: &str = "$JS.ACK.";
         const SKIP: usize = PREFIX.len();
 
-        let mut reply: &str = self.reply.as_ref()?;
+        let mut reply: &str = match self.reply.as_ref() {
+            Some(reply) => reply,
+            None => return Ok(None),
+        };
 
         if !reply.starts_with(PREFIX) {
-            return None;
+            return Ok(None);
         }
 
         reply = &reply[SKIP..];
@@ -295,14 +322,15 @@ impl Message {
                 match str::parse(try_parse!(str)) {
                     Ok(parsed) => parsed,
                     Err(e) => {
-                        log::error!(
+                        let msg = format!(
                             "failed to parse jetstream reply \
                             subject: {}, error: {:?}. Is your \
                             nats-server up to date?",
                             reply,
                             e
                         );
-                        return None;
+                        log::error!("{}", msg);
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
                     }
                 }
             };
@@ -316,13 +344,14 @@ impl Message {
                     }
                     next
                 } else {
-                    log::error!(
+                    let msg = format!(
                         "unexpectedly few tokens while parsing \
                         jetstream reply subject: {}. Is your \
                         nats-server up to date?",
                         reply
                     );
-                    return None;
+                    log::error!("{}", msg);
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
                 }
             };
         }
@@ -336,7 +365,7 @@ impl Message {
         // be the most common. We use >= to be
         // future-proof.
         if n_tokens >= 9 {
-            Some(crate::jetstream::JetStreamMessageInfo {
+            Ok(Some(crate::jetstream::JetStreamMessageInfo {
                 domain: {
                     let domain: &str = try_parse!(str);
                     if domain == "_" {
@@ -353,7 +382,19 @@ impl Message {
                 consumer_seq: try_parse!(),
                 published: {
                     let nanos: i128 = try_parse!();
-                    OffsetDateTime::from_unix_timestamp_nanos(nanos).ok()?
+                    match OffsetDateTime::from_unix_timestamp_nanos(nanos) {
+                        Ok(published) => published,
+                        Err(e) => {
+                            let msg = format!(
+                                "failed to parse jetstream reply \
+                                subject timestamp: {}, error: {:?}. Is your \
+                                nats-server up to date?",
+                                reply, e
+                            );
+                            log::error!("{}", msg);
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+                        }
+                    }
                 },
                 pending: try_parse!(),
                 token: if n_tokens >= 9 {
@@ -361,11 +402,11 @@ impl Message {
                 } else {
                     None
                 },
-            })
+            }))
         } else if n_tokens == 7 {
             // we expect this to be increasingly rare, as older
             // servers are phased out.
-            Some(crate::jetstream::JetStreamMessageInfo {
+            Ok(Some(crate::jetstream::JetStreamMessageInfo {
                 domain: None,
                 acc_hash: None,
                 stream: try_parse!(str),
@@ -375,13 +416,25 @@ impl Message {
                 consumer_seq: try_parse!(),
                 published: {
                     let nanos: i128 = try_parse!();
-                    OffsetDateTime::from_unix_timestamp_nanos(nanos).ok()?
+                    match OffsetDateTime::from_unix_timestamp_nanos(nanos) {
+                        Ok(published) => published,
+                        Err(e) => {
+                            let msg = format!(
+                                "failed to parse jetstream reply \
+                                subject timestamp: {}, error: {:?}. Is your \
+                                nats-server up to date?",
+                                reply, e
+                            );
+                            log::error!("{}", msg);
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+                        }
+                    }
                 },
                 pending: try_parse!(),
                 token: None,
-            })
+            }))
         } else {
-            None
+            Ok(None)
         }
     }
 }
