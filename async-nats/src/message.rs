@@ -35,6 +35,7 @@ pub struct Message {
     pub status: Option<StatusCode>,
     /// Optional [status][crate::Message::status] description.
     pub description: Option<String>,
-
+    /// Length of the message in bytes.
+    #[serde(default)]
     pub length: usize,
 }
