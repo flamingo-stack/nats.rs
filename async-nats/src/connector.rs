@@ -200,12 +200,6 @@ impl Connector {
         Ok(false) // Don't retry
     }
 
-
-    /// Checks if an error is authentication-related
-    fn is_auth_error(error: &str) -> bool {
-        error.contains("status code 401")
-    }
-
     pub(crate) async fn try_connect(&mut self) -> Result<(ServerInfo, Connection), ConnectError> {
         tracing::debug!(attempt = %self.attempts, "connecting to server");
         let mut error = None;
@@ -371,10 +365,7 @@ impl Connector {
                                 let error_text = err.to_string();
                                 tracing::info!(error = %err, error_text = %error_text, "received server error during connection");
                                 
-                                let should_try_auth_callback = match err {
-                                    ServerError::AuthorizationViolation => true,
-                                    _ => Self::is_auth_error(&error_text)
-                                };
+                                let should_try_auth_callback = matches!(err, ServerError::AuthorizationViolation);
                                 
                                 if should_try_auth_callback {
                                     if self.handle_auth_error("server handshake").await? {
@@ -440,8 +431,7 @@ impl Connector {
                         );
                         
                         // Handle auth errors for this connection attempt
-                        let error_text = inner.to_string();
-                        if Self::is_auth_error(&error_text) {
+                        if matches!(inner.kind(), crate::ConnectErrorKind::AuthorizationViolation) {
                             if self.handle_auth_error("handshake").await? {
                                 // Auth callback updated servers, propagate error to trigger reconnection
                                 // This ensures subscriptions are properly restored via normal reconnection flow
@@ -496,15 +486,7 @@ impl Connector {
                 .map_err(|err| {
                     let error_text = err.to_string();
                     tracing::info!(error = %err, error_text = %error_text, "WebSocket connection failed");
-                    
-                    // Check if this is an HTTP authentication error during WebSocket handshake
-                    // Only treat as auth error if it's a real HTTP 401, not generic connection issues
-                     if (Self::is_auth_error(&error_text)) {
-                        tracing::info!("Detected WebSocket HTTP 401 error, treating as authorization violation");
-                        ConnectError::with_source(crate::ConnectErrorKind::AuthorizationViolation, err)
-                    } else {
-                        ConnectError::with_source(crate::ConnectErrorKind::Io, err)
-                    }
+                    ConnectError::with_source(crate::ConnectErrorKind::Io, err)
                 })?;
 
                 let con = WebSocketAdapter::new(ws.0);
@@ -532,15 +514,7 @@ impl Connector {
                 .map_err(|err| {
                     let error_text = err.to_string();
                     tracing::info!(error = %err, error_text = %error_text, "WebSocket TLS connection failed");
-                    
-                    // Check if this is an HTTP authentication error during WebSocket handshake
-                    // Only treat as auth error if it's a real HTTP 401, not generic connection issues
-                     if (Self::is_auth_error(&error_text)) {
-                        tracing::info!("Detected WebSocket TLS HTTP 401 error, treating as authorization violation");
-                        ConnectError::with_source(crate::ConnectErrorKind::AuthorizationViolation, err)
-                    } else {
-                        ConnectError::with_source(crate::ConnectErrorKind::Io, err)
-                    }
+                    ConnectError::with_source(crate::ConnectErrorKind::Io, err)
                 })?;
                 let con = WebSocketAdapter::new(ws.0);
                 Connection::new(Box::new(con), 0, self.connect_stats.clone())
