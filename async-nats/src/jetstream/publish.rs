@@ -12,6 +12,7 @@
 // limitations under the License.
 //
 //! Publish `JetStream` messages.
+use crate::is_default;
 use serde::Deserialize;
 
 /// `PublishAck` is an acknowledgment received after successfully publishing a message.
@@ -23,9 +24,9 @@ pub struct PublishAck {
     #[serde(rename = "seq")]
     pub sequence: u64,
     /// Domain the message was published to
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub domain: String,
     /// True if the published message was determined to be a duplicate, false otherwise.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub duplicate: bool,
 }
