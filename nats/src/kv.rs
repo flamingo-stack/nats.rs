@@ -13,6 +13,7 @@
 
 //! Support for Key Value Store.
 
+use std::fmt;
 use std::io;
 use std::time::Duration;
 
@@ -24,6 +25,43 @@ use crate::jetstream::{
 use crate::message::Message;
 use lazy_static::lazy_static;
 use regex::Regex;
+
+/// The kind of error that can occur when interacting with a key-value store.
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum KvErrorKind {
+    /// The connected server does not support key-value stores.
+    UnsupportedServerVersion,
+    /// The provided bucket name is invalid.
+    InvalidBucketName,
+    /// The provided key is invalid.
+    InvalidKey,
+    /// The requested bucket is not a valid key-value store.
+    InvalidBucket,
+    /// The requested history value exceeds the maximum allowed.
+    HistoryTooLarge,
+    /// Any other error.
+    Other,
+}
+
+impl fmt::Display for KvErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KvErrorKind::UnsupportedServerVersion => {
+                write!(f, "key-value requires at least server version 2.6.2")
+            }
+            KvErrorKind::InvalidBucketName => write!(f, "invalid bucket name"),
+            KvErrorKind::InvalidKey => write!(f, "invalid key"),
+            KvErrorKind::InvalidBucket => write!(f, "bucket not valid key-value store"),
+            KvErrorKind::HistoryTooLarge => write!(f, "history limited to a max of 64"),
+            KvErrorKind::Other => write!(f, "key-value error"),
+        }
+    }
+}
+
+/// Converts a [`KvErrorKind`] and message into an [`io::Error`].
+fn kv_error(kind: KvErrorKind, message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, format!("{kind}: {}", message.into()))
+}
 
 /// Configuration values for key value stores.
 #[derive(Debug, Default)]
@@ -127,17 +165,14 @@ impl JetStream {
     /// ```
     pub fn key_value(&self, bucket: &str) -> io::Result<Store> {
         if !self.connection.is_server_compatible_version(2, 6, 2) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(kv_error(
+                KvErrorKind::UnsupportedServerVersion,
                 "key-value requires at least server version 2.6.2",
             ));
         }
 
         if !is_valid_bucket_name(bucket) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid bucket name",
-            ));
+            return Err(kv_error(KvErrorKind::InvalidBucketName, "invalid bucket name"));
         }
 
         let stream_name = format!("KV_{bucket}");
@@ -146,8 +181,8 @@ impl JetStream {
         // Do some quick sanity checks that this is a correctly formed stream for KV.
         // Max msgs per subject should be > 0.
         if stream_info.config.max_msgs_per_subject < 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(kv_error(
+                KvErrorKind::InvalidBucket,
                 "bucket not valid key-value store",
             ));
         }
@@ -185,8 +220,8 @@ impl JetStream {
     /// ```
     pub fn create_key_value(&self, config: &Config) -> io::Result<Store> {
         if !self.connection.is_server_compatible_version(2, 6, 2) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(kv_error(
+                KvErrorKind::UnsupportedServerVersion,
                 "key-value requires at least server version 2.6.2",
             ));
         }
@@ -200,7 +235,7 @@ impl JetStream {
         };
 
         if !is_valid_bucket_name(&config.bucket) {
-            return Err(io::Error::new(io::ErrorKind::Other, "invalid bucket name"));
+            return Err(kv_error(KvErrorKind::InvalidBucketName, "invalid bucket name"));
         }
 
         self.account_info()?;
@@ -208,8 +243,8 @@ impl JetStream {
         // Default to 1 for history. Max is 64 for now.
         let history = if config.history > 0 {
             if config.history > MAX_HISTORY {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(kv_error(
+                    KvErrorKind::HistoryTooLarge,
                     "history limited to a max of 64",
                 ));
             }
@@ -275,14 +310,14 @@ impl JetStream {
     /// ```
     pub fn delete_key_value(&self, bucket: &str) -> io::Result<()> {
         if !self.connection.is_server_compatible_version(2, 6, 2) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(kv_error(
+                KvErrorKind::UnsupportedServerVersion,
                 "key-value requires at least server version 2.6.2",
             ));
         }
 
         if !is_valid_bucket_name(bucket) {
-            return Err(io::Error::new(io::ErrorKind::Other, "invalid bucket name"));
+            return Err(kv_error(KvErrorKind::InvalidBucketName, "invalid bucket name"));
         }
 
         let stream_name = format!("KV_{bucket}");
@@ -332,6 +367,17 @@ impl Store {
         })
     }
 
+    /// Builds the full subject for a given key, honoring the configured domain prefix.
+    fn key_subject(&self, key: &str) -> String {
+        let mut subject = String::new();
+        if let Some(api_prefix) = self.domain_prefix.as_ref() {
+            subject.push_str(api_prefix);
+        }
+        subject.push_str(&self.prefix);
+        subject.push_str(key);
+        subject
+    }
+
     /// Returns the latest entry for the key, if any.
     ///
     /// # Examples
@@ -358,12 +404,10 @@ impl Store {
     /// ```
     pub fn entry(&self, key: &str) -> io::Result<Option<Entry>> {
         if !is_valid_key(key) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid key"));
+            return Err(kv_error(KvErrorKind::InvalidKey, "invalid key"));
         }
 
-        let mut subject = String::new();
-        subject.push_str(&self.prefix);
-        subject.push_str(key);
+        let subject = self.key_subject(key);
 
         match self.context.get_last_message(&self.stream_name, &subject) {
             Ok(message) => {
@@ -453,15 +497,10 @@ impl Store {
     /// ```
     pub fn put(&self, key: &str, value: impl AsRef<[u8]>) -> io::Result<u64> {
         if !is_valid_key(key) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid key"));
+            return Err(kv_error(KvErrorKind::InvalidKey, "invalid key"));
         }
 
-        let mut subject = String::new();
-        if let Some(api_prefix) = self.domain_prefix.as_ref() {
-            subject.push_str(api_prefix);
-        }
-        subject.push_str(&self.prefix);
-        subject.push_str(key);
+        let subject = self.key_subject(key);
 
         let publish_ack = self.context.publish(&subject, value)?;
 
@@ -530,15 +569,10 @@ impl Store {
     /// ```
     pub fn update(&self, key: &str, value: impl AsRef<[u8]>, revision: u64) -> io::Result<u64> {
         if !is_valid_key(key) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid key"));
+            return Err(kv_error(KvErrorKind::InvalidKey, "invalid key"));
         }
 
-        let mut subject = String::new();
-        if let Some(api_prefix) = self.domain_prefix.as_ref() {
-            subject.push_str(api_prefix);
-        }
-        subject.push_str(&self.prefix);
-        subject.push_str(key);
+        let subject = self.key_subject(key);
 
         let mut headers = HeaderMap::default();
         headers.insert(
@@ -577,15 +611,10 @@ impl Store {
     /// ```
     pub fn delete(&self, key: &str) -> io::Result<()> {
         if !is_valid_key(key) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid key"));
+            return Err(kv_error(KvErrorKind::InvalidKey, "invalid key"));
         }
 
-        let mut subject = String::new();
-        if let Some(api_prefix) = self.domain_prefix.as_ref() {
-            subject.push_str(api_prefix);
-        }
-        subject.push_str(&self.prefix);
-        subject.push_str(key);
+        let subject = self.key_subject(key);
 
         let mut headers = HeaderMap::default();
         headers.insert(KV_OPERATION, KV_OPERATION_DELETE.to_string());
@@ -620,12 +649,10 @@ impl Store {
     /// ```
     pub fn purge(&self, key: &str) -> io::Result<()> {
         if !is_valid_key(key) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid key"));
+            return Err(kv_error(KvErrorKind::InvalidKey, "invalid key"));
         }
 
-        let mut subject = String::new();
-        subject.push_str(&self.prefix);
-        subject.push_str(key);
+        let subject = self.key_subject(key);
 
         let mut headers = HeaderMap::default();
         headers.insert(KV_OPERATION, KV_OPERATION_PURGE.to_string());
