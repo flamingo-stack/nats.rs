@@ -1,4 +1,4 @@
-// Copyright 2020-2023 The NATS Authors
+// Copyright 2020-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -183,7 +183,7 @@ pub struct Info {
     /// The number of messages pending delivery
     pub num_pending: u64,
     /// Information about the consumer's cluster
-    #[serde(skip_serializing_if = "is_default")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<ClusterInfo>,
     /// Indicates if any client is connected and receiving messages from a push consumer
     #[serde(default, skip_serializing_if = "is_default")]
@@ -193,8 +193,11 @@ pub struct Info {
     #[serde(default)]
     pub paused: bool,
     #[cfg(feature = "server_2_11")]
-    /// The remaining time the consumer is paused
-    #[serde(default, with = "serde_nanos")]
+    /// The remaining time the consumer is paused.
+    /// Only meaningful when `paused` is true. A value of `Some(Duration::ZERO)` or `None`
+    /// both indicate the consumer is not paused (or the pause has expired).
+    /// Always check the `paused` field as the authoritative gate before inspecting this value.
+    #[serde(default, with = "serde_nanos::option", skip_serializing_if = "Option::is_none")]
     pub pause_remaining: Option<Duration>,
 }
 
