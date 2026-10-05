@@ -136,9 +136,7 @@ impl Connector {
                         }
                         
                         tracing::error!("Auth URL callback failed or not configured, propagating authorization violation error");
-                        self.events_tx
-                            .try_send(Event::ClientError(ClientError::Other(error.to_string())))
-                            .ok();
+                        return Err(error);
                     }
                     ConnectErrorKind::AuthCallbackReconnect => {
                         // Auth callback succeeded and we need to reconnect with new credentials
@@ -152,6 +150,7 @@ impl Connector {
                         self.events_tx
                             .try_send(Event::ClientError(ClientError::Other(other.to_string())))
                             .ok();
+                        return Err(error);
                     }
                 },
             }

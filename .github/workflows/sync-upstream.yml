@@ -42,8 +42,30 @@ jobs:
             echo "::notice::merge has conflicts — skipping, will retry next run"
             exit 0
           fi
+
+          echo "::group::Verify fork-only auth_url_callback feature survived the merge"
+          if ! grep -R --include="*.rs" -l "auth_url_callback" . > /dev/null; then
+            echo "::error::auth_url_callback fork feature is missing after merging upstream/main — aborting sync, not opening a PR"
+            git checkout origin/main
+            git branch -D "$BRANCH"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Build and test fork feature gate
+        run: |
+          if ! grep -R --include="*.rs" -l "auth_url_callback" . > /dev/null; then
+            echo "::notice::auth_url_callback not found — skipping build gate (handled above)"
+            exit 0
+          fi
+          cargo check --workspace --all-features
+          cargo test --workspace --all-features -- auth_url_callback
+
+      - name: Push branch and open PR
+        run: |
           git push -f origin "$BRANCH"
 
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
             --title "Sync from Fork" \
-            --body "Automatic weekly sync from \`nats-io/nats.rs@main\`."
+            --body "Automatic weekly sync from \`nats-io/nats.rs@main\`. Verified that the fork-only \`auth_url_callback\` feature is present and builds/tests successfully after the merge."
+
