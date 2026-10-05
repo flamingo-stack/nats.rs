@@ -644,15 +644,21 @@ impl ServerAddress {
         }
     }
 
-    /// Returns the host.
+    /// Returns the host, normalizing the surrounding `[]` that `url::Url`
+    /// keeps around literal IPv6 addresses in `host_str()`.
+    ///
+    /// This is the single, local definition of host normalization for this
+    /// type; other methods on `ServerAddress` (e.g. `socket_addrs`) and
+    /// `connect_addr` must go through this method rather than re-deriving
+    /// the host from `self.0` directly.
     pub fn host(&self) -> &str {
         match self.0.host() {
-            Some(Host::Domain(_)) | Some(Host::Ipv4 { .. }) => self.0.host_str().unwrap(),
-            // `host_str()` for Ipv6 includes the []s
             Some(Host::Ipv6 { .. }) => {
+                // `host_str()` for Ipv6 includes the []s
                 let host = self.0.host_str().unwrap();
                 &host[1..host.len() - 1]
             }
+            Some(_) => self.0.host_str().unwrap(),
             None => "",
         }
     }
