@@ -136,9 +136,13 @@ impl Connector {
                         }
                         
                         tracing::error!("Auth URL callback failed or not configured, propagating authorization violation error");
-                        self.events_tx
+                        if self
+                            .events_tx
                             .try_send(Event::ClientError(ClientError::Other(error.to_string())))
-                            .ok();
+                            .is_err()
+                        {
+                            tracing::warn!("failed to send ClientError event: events channel full or closed");
+                        }
                     }
                     ConnectErrorKind::AuthCallbackReconnect => {
                         // Auth callback succeeded and we need to reconnect with new credentials
@@ -149,9 +153,13 @@ impl Connector {
                     }
                     other => {
                         tracing::error!("Connection failed with error: {} (kind: {:?})", error, other);
-                        self.events_tx
+                        if self
+                            .events_tx
                             .try_send(Event::ClientError(ClientError::Other(other.to_string())))
-                            .ok();
+                            .is_err()
+                        {
+                            tracing::warn!("failed to send ClientError event: events channel full or closed");
+                        }
                     }
                 },
             }
@@ -226,9 +234,13 @@ impl Connector {
                         max_reconnects = %max_reconnects,
                         "max reconnection attempts reached"
                     );
-                    self.events_tx
+                    if self
+                        .events_tx
                         .try_send(Event::ClientError(ClientError::MaxReconnects))
-                        .ok();
+                        .is_err()
+                    {
+                        tracing::warn!("failed to send ClientError(MaxReconnects) event: events channel full or closed");
+                    }
                     return Err(ConnectError::new(crate::ConnectErrorKind::MaxReconnects));
                 }
             }
@@ -414,7 +426,9 @@ impl Connector {
                                 );
                                 self.attempts = 0;
                                 self.connect_stats.connects.add(1, Ordering::Relaxed);
-                                self.events_tx.try_send(Event::Connected).ok();
+                                if self.events_tx.try_send(Event::Connected).is_err() {
+                                    tracing::warn!("failed to send Connected event: events channel full or closed");
+                                }
                                 self.state_tx.send(State::Connected).ok();
                                 self.max_payload.store(
                                     server_info.max_payload,
