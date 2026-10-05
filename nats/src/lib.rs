@@ -446,6 +446,10 @@ impl Connection {
 
     /// Create a queue subscription for the given NATS connection.
     ///
+    /// This delegates to the shared [`Connection::do_subscribe`] implementation,
+    /// which is also used by [`Connection::subscribe`], so subscription logic
+    /// is defined in a single place.
+    ///
     /// # Example
     /// ```no_run
     /// # fn main() -> std::io::Result<()> {
@@ -514,6 +518,10 @@ impl Connection {
     /// Publish a message on the given subject as a request and receive the
     /// response.
     ///
+    /// This delegates to [`Connection::request_with_headers_or_timeout`], the
+    /// single shared implementation used by all `request*` variants on this
+    /// type.
+    ///
     /// # Example
     /// ```no_run
     /// # fn main() -> std::io::Result<()> {
@@ -551,6 +559,10 @@ impl Connection {
 
     /// Publish a message with headers on the given subject as a request and receive the
     /// response.
+    ///
+    /// This delegates to [`Connection::request_with_headers_or_timeout`], the
+    /// single shared implementation used by all `request*` variants on this
+    /// type.
     ///
     /// # Example
     /// ```no_run
@@ -850,6 +862,12 @@ impl Connection {
 
     /// Publish a message which may have a reply subject or headers set.
     ///
+    /// This is the single shared implementation backing [`Connection::publish`],
+    /// [`Connection::publish_request`], and the `request*` family of methods on
+    /// this type. [`Connection::try_publish_with_reply_or_headers`] is the
+    /// non-blocking counterpart that delegates to [`client::Client::try_publish`]
+    /// instead of [`client::Client::publish`].
+    ///
     /// # Example
     /// ```no_run
     /// # fn main() -> std::io::Result<()> {
@@ -901,6 +919,10 @@ impl Connection {
     }
 
     /// Attempts to publish a message without blocking.
+    ///
+    /// This is the non-blocking counterpart to
+    /// [`Connection::publish_with_reply_or_headers`]; it shares the same
+    /// argument shape but delegates to [`client::Client::try_publish`].
     #[doc(hidden)]
     pub fn try_publish_with_reply_or_headers(
         &self,
