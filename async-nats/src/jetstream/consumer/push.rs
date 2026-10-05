@@ -42,7 +42,7 @@ use std::{sync::atomic::Ordering, time::Duration};
 #[cfg(feature = "server_2_11")]
 use time::{serde::rfc3339, OffsetDateTime};
 use tokio::{sync::oneshot::error::TryRecvError, task::JoinHandle};
-use tracing::{debug, trace};
+use tracing::{debug, error, trace};
 
 const ORDERED_IDLE_HEARTBEAT: Duration = Duration::from_secs(5);
 
@@ -153,10 +153,14 @@ impl futures_util::Stream for Messages {
                                     // TODO store pending_publish as a future and return errors from it
                                     let client = self.context.client.clone();
                                     tokio::task::spawn(async move {
-                                        client
-                                            .publish(subject, Bytes::from_static(b""))
-                                            .await
-                                            .unwrap();
+                                        if let Err(err) =
+                                            client.publish(subject, Bytes::from_static(b"")).await
+                                        {
+                                            error!(
+                                                "failed to respond to idle heartbeat: {}",
+                                                err
+                                            );
+                                        }
                                     });
                                 }
 
