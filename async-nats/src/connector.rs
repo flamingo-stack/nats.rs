@@ -169,8 +169,17 @@ impl Connector {
                     tracing::info!("Received new URL from auth_url_callback, updating servers");
                     match new_url.parse::<ServerAddr>() {
                         Ok(new_server_addr) => {
-                            // Replace the server list with the new URL
-                            self.servers = vec![(new_server_addr, 0)];
+                            // Merge the new URL into the existing server list instead of
+                            // discarding previously known/discovered servers.
+                            if let Some(entry) = self
+                                .servers
+                                .iter_mut()
+                                .find(|(addr, _)| addr == &new_server_addr)
+                            {
+                                entry.1 = 0;
+                            } else {
+                                self.servers.insert(0, (new_server_addr, 0));
+                            }
                             // Reset attempts to allow reconnection
                             self.attempts = 0;
                             tracing::info!("Updated server list, will retry connection");
