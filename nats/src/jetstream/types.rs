@@ -347,7 +347,7 @@ pub struct StreamConfig {
     /// How many Consumers can be defined for a given Stream, -1 for unlimited
     pub max_consumers: i32,
     /// Maximum age of any message in the stream, expressed in nanoseconds
-    #[serde(with = "serde_nanos")]
+    #[serde(default, with = "serde_nanos", skip_serializing_if = "is_default")]
     pub max_age: Duration,
     /// The largest message that will be accepted by the Stream
     #[serde(default, skip_serializing_if = "is_default")]
