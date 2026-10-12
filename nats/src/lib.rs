@@ -190,7 +190,14 @@
     clippy::wildcard_enum_match_arm,
     clippy::module_name_repetitions
 )]
-// As this is a deprecated client, we don't want warnings from new lints to make CI red.
+// NOTE: This crate is deprecated (see module docs above: use `async-nats` instead) and is
+// retained only for backwards compatibility and critical security fixes, not active feature
+// development. The blanket suppressions below are intentionally scoped to pre-existing lint
+// debt accumulated before this crate entered maintenance-only mode; they are NOT meant to
+// silence findings in new code. CI's crate-wide `-D warnings` / `--deny clippy::all` gate
+// (NATSRS-008-3) is deliberately weakened here for that reason. Do not extend this suppression
+// rationale to any other crate in the workspace, and avoid adding new code to this crate that
+// relies on it to pass lint checks.
 #![allow(clippy::all)]
 #![allow(warnings)]
 /// Async-enabled NATS client.
