@@ -61,8 +61,10 @@ pub struct Config {
     /// Name of the storage bucket.
     pub bucket: String,
     /// A short description of the purpose of this storage bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Maximum age of any value in the bucket, expressed in nanoseconds
+    #[serde(with = "serde_nanos")]
     pub max_age: Duration,
     /// The type of storage backend, `File` (default) and `Memory`
     pub storage: StorageType,
@@ -201,6 +203,7 @@ pub struct ObjectInfo {
     /// Name of the object
     pub name: String,
     /// A short human readable description of the object.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Link this object points to, if any.
     pub link: Option<ObjectLink>,
@@ -228,6 +231,7 @@ pub struct ObjectMeta {
     /// Name of the object
     pub name: String,
     /// A short human readable description of the object.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Link this object points to, if any.
     pub link: Option<ObjectLink>,
@@ -433,9 +437,13 @@ impl ObjectStore {
         }
 
         // Fetch any existing object info, if there is any for later use.
+        // A "not found" condition is treated as "no prior object"; any other
+        // error is propagated since it may indicate a real I/O or server
+        // failure rather than a missing object.
         let maybe_existing_object_info = match self.info(&object_name) {
             Ok(object_info) => Some(object_info),
-            Err(_) => None,
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
         };
 
         let object_nuid = nuid::next();
