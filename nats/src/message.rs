@@ -28,6 +28,10 @@ use time::OffsetDateTime;
 
 pub(crate) const MESSAGE_NOT_BOUND: &str = "message not bound to a connection";
 
+/// Maximum number of retry attempts made by `double_ack` before giving up
+/// and returning an error to the caller.
+const DOUBLE_ACK_MAX_RETRIES: u32 = 30;
+
 /// A message received on a subject.
 #[derive(Clone)]
 pub struct Message {
@@ -207,6 +211,9 @@ impl Message {
     /// See `AckKind` documentation for details of what each variant means.
     ///
     /// Returns immediately if this message has already been double-acked.
+    ///
+    /// Gives up and returns an error after a bounded number of retries
+    /// if the server connection cannot be reestablished.
     pub fn double_ack(&self, ack_kind: crate::jetstream::AckKind) -> io::Result<()> {
         if self.double_acked.load(Ordering::Acquire) {
             return Ok(());
@@ -230,6 +237,12 @@ impl Message {
             retries += 1;
             if retries == 2 {
                 log::warn!("double_ack is retrying until the server connection is reestablished");
+            }
+            if retries > DOUBLE_ACK_MAX_RETRIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "double_ack exceeded maximum number of retries",
+                ));
             }
             let ack_reply = format!("_INBOX.{}", nuid::next());
             let sub_ret = client.subscribe(&ack_reply, None);
