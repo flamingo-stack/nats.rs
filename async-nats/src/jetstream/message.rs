@@ -111,6 +111,34 @@ impl Display for StreamMessageErrorKind {
     }
 }
 
+/// The kinds of errors that can occur while performing a [Message::double_ack] or
+/// [Acker::double_ack].
+#[derive(Debug, Clone, PartialEq)]
+pub enum DoubleAckErrorKind {
+    /// The message is not a JetStream message (no reply subject).
+    NotJetStreamMessage,
+    /// The double ack response timed out.
+    DoubleAckTimeout,
+    /// The subscription used to await the double ack response was dropped
+    /// before a response was received.
+    SubscriptionDropped,
+}
+
+/// Error returned when a [Message::double_ack] or [Acker::double_ack] call fails.
+pub type DoubleAckError = error::Error<DoubleAckErrorKind>;
+
+impl Display for DoubleAckErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DoubleAckErrorKind::NotJetStreamMessage => {
+                write!(f, "no reply subject, not a JetStream message")
+            }
+            DoubleAckErrorKind::DoubleAckTimeout => write!(f, "double ack response timed out"),
+            DoubleAckErrorKind::SubscriptionDropped => write!(f, "subscription dropped"),
+        }
+    }
+}
+
 impl std::ops::Deref for Message {
     type Target = crate::Message;
 
@@ -264,17 +292,16 @@ impl Message {
             match tokio::time::timeout(self.context.timeout, subscription.next())
                 .await
                 .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "double ack response timed out",
-                    )
+                    DoubleAckError::new(DoubleAckErrorKind::DoubleAckTimeout)
                 })? {
                 Some(_) => Ok(()),
-                None => Err(Box::new(std::io::Error::other("subscription dropped"))),
+                None => Err(Box::new(DoubleAckError::new(
+                    DoubleAckErrorKind::SubscriptionDropped,
+                ))),
             }
         } else {
-            Err(Box::new(std::io::Error::other(
-                "No reply subject, not a JetStream message",
+            Err(Box::new(DoubleAckError::new(
+                DoubleAckErrorKind::NotJetStreamMessage,
             )))
         }
     }
@@ -367,7 +394,7 @@ impl Message {
                     OffsetDateTime::from_unix_timestamp_nanos(nanos)?
                 },
                 pending: try_parse!(),
-                token: if n_tokens >= 9 {
+                token: if n_tokens > 9 {
                     Some(try_parse!(str))
                 } else {
                     None
@@ -553,17 +580,16 @@ impl Acker {
             match tokio::time::timeout(self.context.timeout, subscription.next())
                 .await
                 .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "double ack response timed out",
-                    )
+                    DoubleAckError::new(DoubleAckErrorKind::DoubleAckTimeout)
                 })? {
                 Some(_) => Ok(()),
-                None => Err(Box::new(std::io::Error::other("subscription dropped"))),
+                None => Err(Box::new(DoubleAckError::new(
+                    DoubleAckErrorKind::SubscriptionDropped,
+                ))),
             }
         } else {
-            Err(Box::new(std::io::Error::other(
-                "No reply subject, not a JetStream message",
+            Err(Box::new(DoubleAckError::new(
+                DoubleAckErrorKind::NotJetStreamMessage,
             )))
         }
     }
