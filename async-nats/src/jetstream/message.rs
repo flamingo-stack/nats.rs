@@ -111,6 +111,31 @@ impl Display for StreamMessageErrorKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum InfoErrorKind {
+    MissingReplySubject,
+    MissingPrefix,
+    TooFewTokens,
+    ParseError,
+    BadTokenNumber,
+}
+
+/// Error returned when library is unable to parse the `JetStream` message info
+/// out of a message's reply subject.
+pub type InfoError = error::Error<InfoErrorKind>;
+
+impl Display for InfoErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InfoErrorKind::MissingReplySubject => write!(f, "did not found reply subject"),
+            InfoErrorKind::MissingPrefix => write!(f, "did not found proper prefix"),
+            InfoErrorKind::TooFewTokens => write!(f, "too few tokens"),
+            InfoErrorKind::ParseError => write!(f, "parse error"),
+            InfoErrorKind::BadTokenNumber => write!(f, "bad token number"),
+        }
+    }
+}
+
 impl std::ops::Deref for Message {
     type Target = crate::Message;
 
@@ -287,13 +312,11 @@ impl Message {
         const SKIP: usize = PREFIX.len();
 
         let mut reply: &str = self.reply.as_ref().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "did not found reply subject")
+            InfoError::new(InfoErrorKind::MissingReplySubject)
         })?;
 
         if !reply.starts_with(PREFIX) {
-            return Err(Box::new(std::io::Error::other(
-                "did not found proper prefix",
-            )));
+            return Err(Box::new(InfoError::new(InfoErrorKind::MissingPrefix)));
         }
 
         reply = &reply[SKIP..];
@@ -319,7 +342,10 @@ impl Message {
                 match str::parse(try_parse!(str)) {
                     Ok(parsed) => parsed,
                     Err(e) => {
-                        return Err(Box::new(e));
+                        return Err(Box::new(InfoError::with_source(
+                            InfoErrorKind::ParseError,
+                            e,
+                        )));
                     }
                 }
             };
@@ -333,7 +359,7 @@ impl Message {
                     }
                     next
                 } else {
-                    return Err(Box::new(std::io::Error::other("too few tokens")));
+                    return Err(Box::new(InfoError::new(InfoErrorKind::TooFewTokens)));
                 }
             };
         }
@@ -392,7 +418,7 @@ impl Message {
                 token: None,
             })
         } else {
-            Err(Box::new(std::io::Error::other("bad token number")))
+            Err(Box::new(InfoError::new(InfoErrorKind::BadTokenNumber)))
         }
     }
 }
