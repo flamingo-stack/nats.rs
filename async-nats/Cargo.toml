@@ -60,7 +60,7 @@ jsonschema = "0.17.1"
 num = "0.4.1"
 
 [features]
-default = ["server_2_10", "server_2_11", "server_2_12", "ring"]
+default = ["server_2_10", "server_2_11", "server_2_12"]
 # Enables Service API for the client.
 service = []
 websockets = ["dep:tokio-websockets"]
@@ -91,3 +91,4 @@ lto = true
 # We can't use `all-features` because the `fips` doesn't compile in restricted docs.rs environment.
 features = ["server_2_10",  "service", "experimental", "ring", "aws-lc-rs"]
 rustdoc-args = ["--cfg", "docsrs"]
+
