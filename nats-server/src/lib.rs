@@ -44,8 +44,8 @@ lazy_static! {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.inner.child.kill().unwrap();
-        self.inner.child.wait().unwrap();
+        let _ = self.inner.child.kill();
+        let _ = self.inner.child.wait();
         if let Ok(log) = fs::read_to_string(self.inner.logfile.as_os_str()) {
             // Check if we had JetStream running and if so cleanup the storage directory.
             if let Some(caps) = SD_RE.captures(&log) {
@@ -55,6 +55,8 @@ impl Drop for Server {
             // Remove Logfile.
             fs::remove_file(self.inner.logfile.as_os_str()).ok();
         }
+        // Remove PID file.
+        fs::remove_file(self.inner.pidfile.as_os_str()).ok();
     }
 }
 
@@ -65,8 +67,8 @@ impl Server {
             .port
             .clone()
             .expect("can't restart server with dynamic port");
-        self.inner.child.kill().unwrap();
-        self.inner.child.wait().unwrap();
+        let _ = self.inner.child.kill();
+        let _ = self.inner.child.wait();
         let inner = do_run(&self.inner.cfg, Some(&port), Some(self.inner.id.clone()));
         self.inner = inner;
     }
@@ -75,10 +77,23 @@ impl Server {
     // Helpful when dynamically allocating ports with -1.
     pub fn client_url(&self) -> String {
         let addr = self.client_addr();
-        let mut r = BufReader::with_capacity(1024, TcpStream::connect(addr).unwrap());
+        // Retry up to 100 times (100 * 100ms = 10s) waiting for the server to accept connections.
+        let stream = {
+            let mut s = None;
+            for _ in 0..100 {
+                match TcpStream::connect(&addr) {
+                    Ok(stream) => { s = Some(stream); break; }
+                    Err(_) => thread::sleep(Duration::from_millis(100)),
+                }
+            }
+            s.expect("could not connect to server for client_url")
+        };
+        let mut r = BufReader::with_capacity(1024, stream);
         let mut line = String::new();
         r.read_line(&mut line).expect("did not receive INFO");
-        let si: Value = serde_json::from_str(&line["INFO".len()..]).expect("could not parse INFO");
+        let info_prefix = "INFO ";
+        assert!(line.starts_with(info_prefix), "expected INFO, got: {line}");
+        let si: Value = serde_json::from_str(&line[info_prefix.len()..]).expect("could not parse INFO");
         let port = si["port"].as_u64().expect("could not parse port") as u16;
         let mut scheme = "nats://";
         if si["tls_required"].as_bool().unwrap_or(false) {
@@ -89,10 +104,23 @@ impl Server {
 
     pub fn client_port(&self) -> u16 {
         let addr = self.client_addr();
-        let mut r = BufReader::with_capacity(1024, TcpStream::connect(addr).unwrap());
+        // Retry up to 100 times (100 * 100ms = 10s) waiting for the server to accept connections.
+        let stream = {
+            let mut s = None;
+            for _ in 0..100 {
+                match TcpStream::connect(&addr) {
+                    Ok(stream) => { s = Some(stream); break; }
+                    Err(_) => thread::sleep(Duration::from_millis(100)),
+                }
+            }
+            s.expect("could not connect to server for client_port")
+        };
+        let mut r = BufReader::with_capacity(1024, stream);
         let mut line = String::new();
         r.read_line(&mut line).expect("did not receive INFO");
-        let si: Value = serde_json::from_str(&line["INFO".len()..]).expect("could not parse INFO");
+        let info_prefix = "INFO ";
+        assert!(line.starts_with(info_prefix), "expected INFO, got: {line}");
+        let si: Value = serde_json::from_str(&line[info_prefix.len()..]).expect("could not parse INFO");
         si["port"].as_u64().expect("could not parse port") as u16
     }
 
@@ -133,10 +161,25 @@ impl Server {
     }
 
     pub fn client_pid(&self) -> usize {
-        String::from_utf8(fs::read(self.inner.pidfile.clone()).unwrap())
-            .unwrap()
-            .parse()
-            .unwrap()
+        // Retry up to 100 times (100 * 100ms = 10s) waiting for the PID file to appear and be valid.
+        for _ in 0..100 {
+            match fs::read(self.inner.pidfile.clone()) {
+                Ok(bytes) => {
+                    match String::from_utf8(bytes) {
+                        Ok(s) => {
+                            let trimmed = s.trim();
+                            if let Ok(pid) = trimmed.parse::<usize>() {
+                                return pid;
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Err(_) => {}
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("could not read valid PID from pidfile: {:?}", self.inner.pidfile);
     }
 }
 
@@ -194,7 +237,7 @@ pub fn run_cluster<'a, C: IntoConfig<'a>>(cfg: C) -> Cluster {
             new_port
         })
         .collect::<Vec<usize>>();
-    let cluster = [port + 1, port + 101, port + 201];
+    let cluster = [ports[0] + 1, ports[1] + 1, ports[2] + 1];
 
     let s1 = run_cluster_node_with_port(
         cfg.0[0],
