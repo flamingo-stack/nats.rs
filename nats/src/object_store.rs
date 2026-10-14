@@ -365,13 +365,13 @@ impl ObjectStore {
     /// ```
     pub fn info(&self, object_name: &str) -> io::Result<ObjectInfo> {
         // LoOkup the stream to get the bound subject.
-        let object_name = encode_object_name(object_name);
-        if !is_valid_object_name(&object_name) {
+        if !is_valid_object_name(object_name) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid object name",
             ));
         }
+        let object_name = encode_object_name(object_name);
 
         // Grab last meta value we have.
         let stream_name = format!("OBJ_{}", &self.name);
@@ -424,16 +424,16 @@ impl ObjectStore {
         ObjectMeta: From<T>,
     {
         let object_meta: ObjectMeta = meta.into();
-        let object_name = encode_object_name(&object_meta.name);
-        if !is_valid_object_name(&object_name) {
+        if !is_valid_object_name(&object_meta.name) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid object name",
             ));
         }
+        let object_name = encode_object_name(&object_meta.name);
 
         // Fetch any existing object info, if there is any for later use.
-        let maybe_existing_object_info = match self.info(&object_name) {
+        let maybe_existing_object_info = match self.info(&object_meta.name) {
             Ok(object_info) => Some(object_info),
             Err(_) => None,
         };
