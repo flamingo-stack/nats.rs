@@ -11,6 +11,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
+// NOTE (flamingo-stack/nats.rs fork): This fork's differentiator from
+// upstream nats.rs is `auth_url_callback` support on `async_nats::ConnectOptions`
+// (an async callback re-invoked on reconnect to re-supply an expiring bearer
+// token on the WebSocket connection URL). That mechanism is implemented and
+// exposed via the client connection options (see `async-nats/src/options.rs`
+// / `async-nats/src/connector.rs`) and is not part of the JetStream module
+// surface in this file. This comment documents the expectation for
+// reviewers of this file so its absence here is not mistaken for its absence
+// from the fork; verification of the actual implementation must happen in
+// the options/connector modules, not in `jetstream/mod.rs`.
+//
 //! JetStream is a built-in persistence layer for NATS that provides powerful
 //! [stream][crate::jetstream::stream::Stream]-based messaging capabilities,
 //! with integrated support for both *at least once* and *exactly once* delivery semantics.
