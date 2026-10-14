@@ -53,6 +53,44 @@ static SEMVER: Lazy<Regex> = Lazy::new(|| {
 // From ADR-33: Name can only have A-Z, a-z, 0-9, dash, underscore.
 static NAME: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z0-9\-_]+$").unwrap());
 
+/// Error returned when creating or configuring a [Service] fails due to invalid input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceError {
+    kind: ServiceErrorKind,
+    message: String,
+}
+
+/// Kind of error that can occur when validating [Service] configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceErrorKind {
+    /// The provided service version is not a valid semver string.
+    InvalidVersion,
+    /// The provided service name is not a valid string.
+    InvalidName,
+}
+
+impl ServiceError {
+    fn new(kind: ServiceErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// Returns the kind of this error.
+    pub fn kind(&self) -> ServiceErrorKind {
+        self.kind
+    }
+}
+
+impl Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ServiceError {}
+
 /// Represents state for all endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Endpoints {
@@ -328,15 +366,15 @@ impl Service {
     async fn add(client: Client, config: Config) -> Result<Service, Error> {
         // validate service version semver string.
         if !SEMVER.is_match(config.version.as_str()) {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(Box::new(ServiceError::new(
+                ServiceErrorKind::InvalidVersion,
                 "service version is not a valid semver string",
             )));
         }
         // validate service name.
         if !NAME.is_match(config.name.as_str()) {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(Box::new(ServiceError::new(
+                ServiceErrorKind::InvalidName,
                 "service name is not a valid string (only A-Z, a-z, 0-9, _, - are allowed)",
             )));
         }
@@ -380,6 +418,10 @@ impl Service {
                 loop {
                     tokio::select! {
                         Some(ping) = pings.next() => {
+                            let Some(reply) = ping.reply.clone() else {
+                                debug!("ignoring PING request without reply subject");
+                                continue;
+                            };
                             let pong = serde_json::to_vec(&PingResponse{
                                 kind: "io.nats.micro.v1.ping_response".to_string(),
                                 name: info.name.clone(),
@@ -387,9 +429,13 @@ impl Service {
                                 version: info.version.clone(),
                                 metadata: info.metadata.clone(),
                             })?;
-                            client.publish(ping.reply.unwrap(), pong.into()).await?;
+                            client.publish(reply, pong.into()).await?;
                         },
                         Some(info_request) = infos.next() => {
+                            let Some(reply) = info_request.reply.clone() else {
+                                debug!("ignoring INFO request without reply subject");
+                                continue;
+                            };
                             let info = info.clone();
 
                             let endpoints: Vec<endpoint::Info> = {
@@ -407,9 +453,13 @@ impl Service {
                                 ..info
                             };
                             let info_json = serde_json::to_vec(&info).map(Bytes::from)?;
-                            client.publish(info_request.reply.unwrap(), info_json.clone()).await?;
+                            client.publish(reply, info_json.clone()).await?;
                         },
                         Some(stats_request) = stats.next() => {
+                            let Some(reply) = stats_request.reply.clone() else {
+                                debug!("ignoring STATS request without reply subject");
+                                continue;
+                            };
                             if let Some(stats_callback) = stats_callback.as_mut() {
                                 let mut endpoint_stats_locked = endpoints_state.lock().unwrap();
                                 for (key, value) in &mut endpoint_stats_locked.endpoints {
@@ -425,7 +475,7 @@ impl Service {
                                 started,
                                 endpoints: endpoints_state.lock().unwrap().endpoints.values().cloned().map(Into::into).collect(),
                             })?;
-                            client.publish(stats_request.reply.unwrap(), stats.into()).await?;
+                            client.publish(reply, stats.into()).await?;
                         },
                         else => break,
                     }
