@@ -111,6 +111,66 @@ impl Display for StreamMessageErrorKind {
     }
 }
 
+/// Error kind returned by [Message::ack], [Message::ack_with], [Message::double_ack],
+/// [Acker::ack], [Acker::ack_with] and [Acker::double_ack].
+#[derive(Debug, Clone, PartialEq)]
+pub enum AckErrorKind {
+    /// The message does not have a reply subject, so it is not a JetStream message.
+    MissingReplySubject,
+    /// Timed out while waiting for double-ack confirmation from the server.
+    TimedOut,
+    /// The double-ack subscription was dropped before a response was received.
+    Dropped,
+    /// An error occurred while publishing or subscribing on the underlying client.
+    Other,
+}
+
+/// Error returned when acknowledging a message fails.
+pub type AckError = error::Error<AckErrorKind>;
+
+impl Display for AckErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AckErrorKind::MissingReplySubject => {
+                write!(f, "no reply subject, not a JetStream message")
+            }
+            AckErrorKind::TimedOut => write!(f, "double ack response timed out"),
+            AckErrorKind::Dropped => write!(f, "subscription dropped"),
+            AckErrorKind::Other => write!(f, "error acknowledging message"),
+        }
+    }
+}
+
+/// Error kind returned by [Message::info].
+#[derive(Debug, Clone, PartialEq)]
+pub enum InfoErrorKind {
+    /// The message does not have a reply subject.
+    MissingReplySubject,
+    /// The reply subject does not start with the expected JetStream ack prefix.
+    MissingPrefix,
+    /// The reply subject does not contain enough tokens to be parsed.
+    TooFewTokens,
+    /// The reply subject contains an unexpected number of tokens.
+    BadTokenNumber,
+    /// A token in the reply subject could not be parsed into the expected type.
+    ParseError,
+}
+
+/// Error returned when parsing [Info] out of a message's reply subject fails.
+pub type InfoError = error::Error<InfoErrorKind>;
+
+impl Display for InfoErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InfoErrorKind::MissingReplySubject => write!(f, "did not found reply subject"),
+            InfoErrorKind::MissingPrefix => write!(f, "did not found proper prefix"),
+            InfoErrorKind::TooFewTokens => write!(f, "too few tokens"),
+            InfoErrorKind::BadTokenNumber => write!(f, "bad token number"),
+            InfoErrorKind::ParseError => write!(f, "failed to parse token"),
+        }
+    }
+}
+
 impl std::ops::Deref for Message {
     type Target = crate::Message;
 
@@ -168,17 +228,15 @@ impl Message {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn ack(&self) -> Result<(), Error> {
+    pub async fn ack(&self) -> Result<(), AckError> {
         if let Some(ref reply) = self.reply {
             self.context
                 .client
                 .publish(reply.clone(), "".into())
-                .map_err(Error::from)
+                .map_err(|err| AckError::with_source(AckErrorKind::Other, err))
                 .await
         } else {
-            Err(Box::new(std::io::Error::other(
-                "No reply subject, not a JetStream message",
-            )))
+            Err(AckError::new(AckErrorKind::MissingReplySubject))
         }
     }
 
@@ -209,17 +267,15 @@ impl Message {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn ack_with(&self, kind: AckKind) -> Result<(), Error> {
+    pub async fn ack_with(&self, kind: AckKind) -> Result<(), AckError> {
         if let Some(ref reply) = self.reply {
             self.context
                 .client
                 .publish(reply.to_owned(), kind.into())
-                .map_err(Error::from)
+                .map_err(|err| AckError::with_source(AckErrorKind::Other, err))
                 .await
         } else {
-            Err(Box::new(std::io::Error::other(
-                "No reply subject, not a JetStream message",
-            )))
+            Err(AckError::new(AckErrorKind::MissingReplySubject))
         }
     }
 
@@ -253,47 +309,46 @@ impl Message {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn double_ack(&self) -> Result<(), Error> {
+    pub async fn double_ack(&self) -> Result<(), AckError> {
         if let Some(ref reply) = self.reply {
             let inbox = self.context.client.new_inbox();
-            let mut subscription = self.context.client.subscribe(inbox.clone()).await?;
+            let mut subscription = self
+                .context
+                .client
+                .subscribe(inbox.clone())
+                .await
+                .map_err(|err| AckError::with_source(AckErrorKind::Other, err))?;
             self.context
                 .client
                 .publish_with_reply(reply.clone(), inbox, AckKind::Ack.into())
-                .await?;
+                .await
+                .map_err(|err| AckError::with_source(AckErrorKind::Other, err))?;
             match tokio::time::timeout(self.context.timeout, subscription.next())
                 .await
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "double ack response timed out",
-                    )
-                })? {
+                .map_err(|_| AckError::new(AckErrorKind::TimedOut))?
+            {
                 Some(_) => Ok(()),
-                None => Err(Box::new(std::io::Error::other("subscription dropped"))),
+                None => Err(AckError::new(AckErrorKind::Dropped)),
             }
         } else {
-            Err(Box::new(std::io::Error::other(
-                "No reply subject, not a JetStream message",
-            )))
+            Err(AckError::new(AckErrorKind::MissingReplySubject))
         }
     }
 
     /// Returns the `JetStream` message ID
     /// if this is a `JetStream` message.
     #[allow(clippy::mixed_read_write_in_expression)]
-    pub fn info(&self) -> Result<Info<'_>, Error> {
+    pub fn info(&self) -> Result<Info<'_>, InfoError> {
         const PREFIX: &str = "$JS.ACK.";
         const SKIP: usize = PREFIX.len();
 
-        let mut reply: &str = self.reply.as_ref().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "did not found reply subject")
-        })?;
+        let mut reply: &str = self
+            .reply
+            .as_ref()
+            .ok_or_else(|| InfoError::new(InfoErrorKind::MissingReplySubject))?;
 
         if !reply.starts_with(PREFIX) {
-            return Err(Box::new(std::io::Error::other(
-                "did not found proper prefix",
-            )));
+            return Err(InfoError::new(InfoErrorKind::MissingPrefix));
         }
 
         reply = &reply[SKIP..];
@@ -319,7 +374,7 @@ impl Message {
                 match str::parse(try_parse!(str)) {
                     Ok(parsed) => parsed,
                     Err(e) => {
-                        return Err(Box::new(e));
+                        return Err(InfoError::with_source(InfoErrorKind::ParseError, e));
                     }
                 }
             };
@@ -333,7 +388,7 @@ impl Message {
                     }
                     next
                 } else {
-                    return Err(Box::new(std::io::Error::other("too few tokens")));
+                    return Err(InfoError::new(InfoErrorKind::TooFewTokens));
                 }
             };
         }
@@ -364,7 +419,8 @@ impl Message {
                 consumer_sequence: try_parse!(),
                 published: {
                     let nanos: i128 = try_parse!();
-                    OffsetDateTime::from_unix_timestamp_nanos(nanos)?
+                    OffsetDateTime::from_unix_timestamp_nanos(nanos)
+                        .map_err(|err| InfoError::with_source(InfoErrorKind::ParseError, err))?
                 },
                 pending: try_parse!(),
                 token: if n_tokens >= 9 {
@@ -386,13 +442,14 @@ impl Message {
                 consumer_sequence: try_parse!(),
                 published: {
                     let nanos: i128 = try_parse!();
-                    OffsetDateTime::from_unix_timestamp_nanos(nanos)?
+                    OffsetDateTime::from_unix_timestamp_nanos(nanos)
+                        .map_err(|err| InfoError::with_source(InfoErrorKind::ParseError, err))?
                 },
                 pending: try_parse!(),
                 token: None,
             })
         } else {
-            Err(Box::new(std::io::Error::other("bad token number")))
+            Err(InfoError::new(InfoErrorKind::BadTokenNumber))
         }
     }
 }
@@ -445,17 +502,15 @@ impl Acker {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn ack(&self) -> Result<(), Error> {
+    pub async fn ack(&self) -> Result<(), AckError> {
         if let Some(ref reply) = self.reply {
             self.context
                 .client
                 .publish(reply.to_owned(), "".into())
-                .map_err(Error::from)
+                .map_err(|err| AckError::with_source(AckErrorKind::Other, err))
                 .await
         } else {
-            Err(Box::new(std::io::Error::other(
-                "No reply subject, not a JetStream message",
-            )))
+            Err(AckError::new(AckErrorKind::MissingReplySubject))
         }
     }
 
@@ -492,17 +547,15 @@ impl Acker {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn ack_with(&self, kind: AckKind) -> Result<(), Error> {
+    pub async fn ack_with(&self, kind: AckKind) -> Result<(), AckError> {
         if let Some(ref reply) = self.reply {
             self.context
                 .client
                 .publish(reply.to_owned(), kind.into())
-                .map_err(Error::from)
+                .map_err(|err| AckError::with_source(AckErrorKind::Other, err))
                 .await
         } else {
-            Err(Box::new(std::io::Error::other(
-                "No reply subject, not a JetStream message",
-            )))
+            Err(AckError::new(AckErrorKind::MissingReplySubject))
         }
     }
 
@@ -542,29 +595,29 @@ impl Acker {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn double_ack(&self) -> Result<(), Error> {
+    pub async fn double_ack(&self) -> Result<(), AckError> {
         if let Some(ref reply) = self.reply {
             let inbox = self.context.client.new_inbox();
-            let mut subscription = self.context.client.subscribe(inbox.to_owned()).await?;
+            let mut subscription = self
+                .context
+                .client
+                .subscribe(inbox.to_owned())
+                .await
+                .map_err(|err| AckError::with_source(AckErrorKind::Other, err))?;
             self.context
                 .client
                 .publish_with_reply(reply.to_owned(), inbox, AckKind::Ack.into())
-                .await?;
+                .await
+                .map_err(|err| AckError::with_source(AckErrorKind::Other, err))?;
             match tokio::time::timeout(self.context.timeout, subscription.next())
                 .await
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "double ack response timed out",
-                    )
-                })? {
+                .map_err(|_| AckError::new(AckErrorKind::TimedOut))?
+            {
                 Some(_) => Ok(()),
-                None => Err(Box::new(std::io::Error::other("subscription dropped"))),
+                None => Err(AckError::new(AckErrorKind::Dropped)),
             }
         } else {
-            Err(Box::new(std::io::Error::other(
-                "No reply subject, not a JetStream message",
-            )))
+            Err(AckError::new(AckErrorKind::MissingReplySubject))
         }
     }
 }
