@@ -32,6 +32,12 @@ pub(crate) struct StreamMessageGetRequest {
 }
 
 /// A raw stream message in the representation it is stored.
+///
+/// Note: this type is intentionally local to the synchronous `nats` crate.
+/// It has a similarly-shaped counterpart in the separate `async-nats` crate
+/// (`async_nats::jetstream::stream::RawMessage`), but the two crates do not
+/// share a dependency that would allow reuse without introducing a new
+/// cross-crate coupling.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RawStreamMessage {
     /// Subject of the message.
@@ -421,6 +427,12 @@ pub struct StreamInfo {
 }
 
 /// Information about a received message
+///
+/// Note: this type is intentionally local to the synchronous `nats` crate.
+/// It has a similarly-shaped counterpart in the separate `async-nats` crate
+/// (`async_nats::jetstream::message::Info`), but the two crates do not share
+/// a dependency that would allow reuse without introducing a new cross-crate
+/// coupling.
 #[derive(Debug, Clone)]
 pub struct JetStreamMessageInfo<'a> {
     /// Optional domain, present in servers post-ADR-15
@@ -467,6 +479,11 @@ pub struct StreamState {
 }
 
 /// `DeliverPolicy` determines how the consumer should select the first message to deliver.
+///
+/// Note: this type is intentionally local to the synchronous `nats` crate.
+/// It has similarly-shaped enums in the separate `async-nats` crate, but the
+/// two crates do not share a dependency that would allow reuse without
+/// introducing a new cross-crate coupling.
 #[derive(Default, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DeliverPolicy {
@@ -498,6 +515,12 @@ pub enum DeliverPolicy {
 
 /// Determines whether messages will be acknowledged individually,
 /// in batches, or never.
+///
+/// Note: this type is intentionally local to the synchronous `nats` crate.
+/// It has a similarly-shaped counterpart in the separate `async-nats` crate
+/// (`async_nats::jetstream::consumer::AckPolicy`), but the two crates do not
+/// share a dependency that would allow reuse without introducing a new
+/// cross-crate coupling.
 #[derive(Default, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AckPolicy {
@@ -556,6 +579,11 @@ pub struct PurgeResponse {
 }
 
 /// `RetentionPolicy` determines how messages in a set are retained.
+///
+/// Note: this type is intentionally local to the synchronous `nats` crate.
+/// It has similarly-shaped enums in the separate `async-nats` crate, but the
+/// two crates do not share a dependency that would allow reuse without
+/// introducing a new cross-crate coupling.
 #[derive(Default, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RetentionPolicy {
@@ -722,6 +750,12 @@ pub struct ClusterInfo {
 }
 
 /// The members of the RAFT cluster
+///
+/// Note: this type is intentionally local to the synchronous `nats` crate.
+/// It has a similarly-shaped counterpart in the separate `async-nats` crate
+/// (`async_nats::jetstream::stream::PeerInfo`), but the two crates do not
+/// share a dependency that would allow reuse without introducing a new
+/// cross-crate coupling.
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
     /// The server name of the peer.

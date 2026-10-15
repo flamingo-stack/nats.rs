@@ -216,159 +216,168 @@ pub struct SequenceInfo {
     pub last_active: Option<time::OffsetDateTime>,
 }
 
-/// Configuration for consumers. From a high level, the
-/// `durable_name` and `deliver_subject` fields have a particularly
-/// strong influence on the consumer's overall behavior.
-#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct Config {
-    /// Setting `deliver_subject` to `Some(...)` will cause this consumer
-    /// to be "push-based". This is analogous in some ways to a normal
-    /// NATS subscription (rather than a queue subscriber) in that the
-    /// consumer will receive all messages published to the stream that
-    /// the consumer is interested in. Acknowledgment policies such as
-    /// `AckPolicy::None` and `AckPolicy::All` may be enabled for such
-    /// push-based consumers, which reduce the amount of effort spent
-    /// tracking delivery. Combining `AckPolicy::All` with
-    /// `Consumer::process_batch` enables particularly nice throughput
-    /// optimizations.
-    ///
-    /// Setting `deliver_subject` to `None` will cause this consumer to
-    /// be "pull-based", and will require explicit acknowledgment of
-    /// each message. This is analogous in some ways to a normal NATS
-    /// queue subscriber, where a message will be delivered to a single
-    /// subscriber. Pull-based consumers are intended to be used for
-    /// workloads where it is desirable to have a single process receive
-    /// a message. The only valid `ack_policy` for pull-based consumers
-    /// is the default of `AckPolicy::Explicit`, which acknowledges each
-    /// processed message individually. Pull-based consumers may be a
-    /// good choice for work queue-like workloads where you want messages
-    /// to be handled by a single consumer process. Note that it is
-    /// possible to deliver a message to multiple consumers if the
-    /// consumer crashes or is slow to acknowledge the delivered message.
-    /// This is a fundamental behavior present in all distributed systems
-    /// that attempt redelivery when a consumer fails to acknowledge a message.
-    /// This is known as "at least once" message processing. To achieve
-    /// "exactly once" semantics, it is necessary to implement idempotent
-    /// semantics in any system that is written to as a result of processing
-    /// a message.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deliver_subject: Option<String>,
+/// Configuration for consumers. This is the canonical, general-purpose consumer
+/// configuration type. Both [pull::Config] and [push::Config] are convertible
+/// to/from this type via [IntoConsumerConfig] and [FromConsumer].
+pub use self::config::Config;
 
-    /// Setting `durable_name` to `Some(...)` will cause this consumer
-    /// to be "durable". This may be a good choice for workloads that
-    /// benefit from the `JetStream` server or cluster remembering the
-    /// progress of consumers for fault tolerance purposes. If a consumer
-    /// crashes, the `JetStream` server or cluster will remember which
-    /// messages the consumer acknowledged. When the consumer recovers,
-    /// this information will allow the consumer to resume processing
-    /// where it left off. If you're unsure, set this to `Some(...)`.
-    ///
-    /// Setting `durable_name` to `None` will cause this consumer to
-    /// be "ephemeral". This may be a good choice for workloads where
-    /// you don't need the `JetStream` server to remember the consumer's
-    /// progress in the case of a crash, such as certain "high churn"
-    /// workloads or workloads where a crashed instance is not required
-    /// to recover.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub durable_name: Option<String>,
-    /// A name of the consumer. Can be specified for both durable and ephemeral
-    /// consumers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// A short description of the purpose of this consumer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Deliver group to use.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deliver_group: Option<String>,
-    /// Allows for a variety of options that determine how this consumer will receive messages
-    #[serde(flatten)]
-    pub deliver_policy: DeliverPolicy,
-    /// How messages should be acknowledged
-    pub ack_policy: AckPolicy,
-    /// How long to allow messages to remain un-acknowledged before attempting redelivery
-    #[serde(default, with = "serde_nanos", skip_serializing_if = "is_default")]
-    pub ack_wait: Duration,
-    /// Maximum number of times a specific message will be delivered. Use this to avoid poison pill messages that repeatedly crash your consumer processes forever.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub max_deliver: i64,
-    /// When consuming from a Stream with many subjects, or wildcards, this selects only specific incoming subjects. Supports wildcards.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub filter_subject: String,
-    #[cfg(feature = "server_2_10")]
-    /// Fulfills the same role as [Config::filter_subject], but allows filtering by many subjects.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub filter_subjects: Vec<String>,
-    /// Whether messages are sent as quickly as possible or at the rate of receipt
-    pub replay_policy: ReplayPolicy,
-    /// The rate of message delivery in bits per second
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub rate_limit: u64,
-    /// What percentage of acknowledgments should be samples for observability, 0-100
-    #[serde(
-        rename = "sample_freq",
-        with = "sample_freq_deser",
-        default,
-        skip_serializing_if = "is_default"
-    )]
-    pub sample_frequency: u8,
-    /// The maximum number of waiting consumers.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub max_waiting: i64,
-    /// The maximum number of unacknowledged messages that may be
-    /// in-flight before pausing sending additional messages to
-    /// this consumer.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub max_ack_pending: i64,
-    /// Only deliver headers without payloads.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub headers_only: bool,
-    /// Enable flow control messages
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub flow_control: bool,
-    /// Enable idle heartbeat messages
-    #[serde(default, with = "serde_nanos", skip_serializing_if = "is_default")]
-    pub idle_heartbeat: Duration,
-    /// Maximum size of a request batch
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub max_batch: i64,
-    /// Maximum size of a request max_bytes
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub max_bytes: i64,
-    /// Maximum value for request expiration
-    #[serde(default, with = "serde_nanos", skip_serializing_if = "is_default")]
-    pub max_expires: Duration,
-    /// Threshold for ephemeral consumer inactivity
-    #[serde(default, with = "serde_nanos", skip_serializing_if = "is_default")]
-    pub inactive_threshold: Duration,
-    /// Number of consumer replicas
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub num_replicas: usize,
-    /// Force consumer to use memory storage.
-    #[serde(default, skip_serializing_if = "is_default", rename = "mem_storage")]
-    pub memory_storage: bool,
+mod config {
+    use super::*;
 
-    #[cfg(feature = "server_2_10")]
-    /// Additional consumer metadata.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub metadata: HashMap<String, String>,
-    /// Custom backoff for missed acknowledgments.
-    #[serde(default, skip_serializing_if = "is_default", with = "serde_nanos")]
-    pub backoff: Vec<Duration>,
-    #[cfg(feature = "server_2_11")]
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub priority_policy: PriorityPolicy,
-    #[cfg(feature = "server_2_11")]
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub priority_groups: Vec<String>,
-    /// For suspending the consumer until the deadline.
-    #[cfg(feature = "server_2_11")]
-    #[serde(
-        default,
-        with = "rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub pause_until: Option<OffsetDateTime>,
+    /// Configuration for consumers. From a high level, the
+    /// `durable_name` and `deliver_subject` fields have a particularly
+    /// strong influence on the consumer's overall behavior.
+    #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+    pub struct Config {
+        /// Setting `deliver_subject` to `Some(...)` will cause this consumer
+        /// to be "push-based". This is analogous in some ways to a normal
+        /// NATS subscription (rather than a queue subscriber) in that the
+        /// consumer will receive all messages published to the stream that
+        /// the consumer is interested in. Acknowledgment policies such as
+        /// `AckPolicy::None` and `AckPolicy::All` may be enabled for such
+        /// push-based consumers, which reduce the amount of effort spent
+        /// tracking delivery. Combining `AckPolicy::All` with
+        /// `Consumer::process_batch` enables particularly nice throughput
+        /// optimizations.
+        ///
+        /// Setting `deliver_subject` to `None` will cause this consumer to
+        /// be "pull-based", and will require explicit acknowledgment of
+        /// each message. This is analogous in some ways to a normal NATS
+        /// queue subscriber, where a message will be delivered to a single
+        /// subscriber. Pull-based consumers are intended to be used for
+        /// workloads where it is desirable to have a single process receive
+        /// a message. The only valid `ack_policy` for pull-based consumers
+        /// is the default of `AckPolicy::Explicit`, which acknowledges each
+        /// processed message individually. Pull-based consumers may be a
+        /// good choice for work queue-like workloads where you want messages
+        /// to be handled by a single consumer process. Note that it is
+        /// possible to deliver a message to multiple consumers if the
+        /// consumer crashes or is slow to acknowledge the delivered message.
+        /// This is a fundamental behavior present in all distributed systems
+        /// that attempt redelivery when a consumer fails to acknowledge a message.
+        /// This is known as "at least once" message processing. To achieve
+        /// "exactly once" semantics, it is necessary to implement idempotent
+        /// semantics in any system that is written to as a result of processing
+        /// a message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub deliver_subject: Option<String>,
+
+        /// Setting `durable_name` to `Some(...)` will cause this consumer
+        /// to be "durable". This may be a good choice for workloads that
+        /// benefit from the `JetStream` server or cluster remembering the
+        /// progress of consumers for fault tolerance purposes. If a consumer
+        /// crashes, the `JetStream` server or cluster will remember which
+        /// messages the consumer acknowledged. When the consumer recovers,
+        /// this information will allow the consumer to resume processing
+        /// where it left off. If you're unsure, set this to `Some(...)`.
+        ///
+        /// Setting `durable_name` to `None` will cause this consumer to
+        /// be "ephemeral". This may be a good choice for workloads where
+        /// you don't need the `JetStream` server to remember the consumer's
+        /// progress in the case of a crash, such as certain "high churn"
+        /// workloads or workloads where a crashed instance is not required
+        /// to recover.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub durable_name: Option<String>,
+        /// A name of the consumer. Can be specified for both durable and ephemeral
+        /// consumers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        /// A short description of the purpose of this consumer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        /// Deliver group to use.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub deliver_group: Option<String>,
+        /// Allows for a variety of options that determine how this consumer will receive messages
+        #[serde(flatten)]
+        pub deliver_policy: DeliverPolicy,
+        /// How messages should be acknowledged
+        pub ack_policy: AckPolicy,
+        /// How long to allow messages to remain un-acknowledged before attempting redelivery
+        #[serde(default, with = "serde_nanos", skip_serializing_if = "is_default")]
+        pub ack_wait: Duration,
+        /// Maximum number of times a specific message will be delivered. Use this to avoid poison pill messages that repeatedly crash your consumer processes forever.
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub max_deliver: i64,
+        /// When consuming from a Stream with many subjects, or wildcards, this selects only specific incoming subjects. Supports wildcards.
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub filter_subject: String,
+        #[cfg(feature = "server_2_10")]
+        /// Fulfills the same role as [Config::filter_subject], but allows filtering by many subjects.
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub filter_subjects: Vec<String>,
+        /// Whether messages are sent as quickly as possible or at the rate of receipt
+        pub replay_policy: ReplayPolicy,
+        /// The rate of message delivery in bits per second
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub rate_limit: u64,
+        /// What percentage of acknowledgments should be samples for observability, 0-100
+        #[serde(
+            rename = "sample_freq",
+            with = "sample_freq_deser",
+            default,
+            skip_serializing_if = "is_default"
+        )]
+        pub sample_frequency: u8,
+        /// The maximum number of waiting consumers.
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub max_waiting: i64,
+        /// The maximum number of unacknowledged messages that may be
+        /// in-flight before pausing sending additional messages to
+        /// this consumer.
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub max_ack_pending: i64,
+        /// Only deliver headers without payloads.
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub headers_only: bool,
+        /// Enable flow control messages
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub flow_control: bool,
+        /// Enable idle heartbeat messages
+        #[serde(default, with = "serde_nanos", skip_serializing_if = "is_default")]
+        pub idle_heartbeat: Duration,
+        /// Maximum size of a request batch
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub max_batch: i64,
+        /// Maximum size of a request max_bytes
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub max_bytes: i64,
+        /// Maximum value for request expiration
+        #[serde(default, with = "serde_nanos", skip_serializing_if = "is_default")]
+        pub max_expires: Duration,
+        /// Threshold for ephemeral consumer inactivity
+        #[serde(default, with = "serde_nanos", skip_serializing_if = "is_default")]
+        pub inactive_threshold: Duration,
+        /// Number of consumer replicas
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub num_replicas: usize,
+        /// Force consumer to use memory storage.
+        #[serde(default, skip_serializing_if = "is_default", rename = "mem_storage")]
+        pub memory_storage: bool,
+
+        #[cfg(feature = "server_2_10")]
+        /// Additional consumer metadata.
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub metadata: HashMap<String, String>,
+        /// Custom backoff for missed acknowledgments.
+        #[serde(default, skip_serializing_if = "is_default", with = "serde_nanos")]
+        pub backoff: Vec<Duration>,
+        #[cfg(feature = "server_2_11")]
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub priority_policy: PriorityPolicy,
+        #[cfg(feature = "server_2_11")]
+        #[serde(default, skip_serializing_if = "is_default")]
+        pub priority_groups: Vec<String>,
+        /// For suspending the consumer until the deadline.
+        #[cfg(feature = "server_2_11")]
+        #[serde(
+            default,
+            with = "rfc3339::option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub pause_until: Option<OffsetDateTime>,
+    }
 }
 
 #[cfg(feature = "server_2_11")]
@@ -463,21 +472,10 @@ pub enum DeliverPolicy {
 
 /// Determines whether messages will be acknowledged individually,
 /// in batches, or never.
-#[derive(Default, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum AckPolicy {
-    /// All messages will be individually acknowledged. This is the default.
-    #[default]
-    #[serde(rename = "explicit")]
-    Explicit = 2,
-    /// No messages are acknowledged.
-    #[serde(rename = "none")]
-    None = 0,
-    /// Acknowledges all messages with lower sequence numbers when a later
-    /// message is acknowledged. Useful for "batching" acknowledgment.
-    #[serde(rename = "all")]
-    All = 1,
-}
+///
+/// This is the canonical acknowledgment policy type, shared by consumer
+/// configuration structures throughout the crate.
+pub type AckPolicy = crate::jetstream::stream::RetentionPolicy;
 
 /// `ReplayPolicy` controls whether messages are sent to a consumer
 /// as quickly as possible or at the rate that they were originally received at.
