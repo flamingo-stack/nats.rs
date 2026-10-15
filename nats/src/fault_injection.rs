@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::float_arithmetic)]
+#![allow(clippy::float_arithmetic)] // fault-injection jitter intentionally uses float math for randomized timing; not a correctness-sensitive path
 
 use std::io::{self, Error, ErrorKind};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
