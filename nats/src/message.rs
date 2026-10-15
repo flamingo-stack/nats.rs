@@ -356,7 +356,7 @@ impl Message {
                     OffsetDateTime::from_unix_timestamp_nanos(nanos).ok()?
                 },
                 pending: try_parse!(),
-                token: if n_tokens >= 9 {
+                token: if n_tokens >= 10 {
                     Some(try_parse!(str))
                 } else {
                     None

@@ -26,15 +26,20 @@ pub struct Message {
     pub subject: Subject,
     /// Optional reply subject to which response can be published by [crate::Subscriber].
     /// Used for request-response pattern with [crate::Client::request].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reply: Option<Subject>,
     /// Payload of the message. Can be any arbitrary data format.
     pub payload: Bytes,
     /// Optional headers.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<HeaderMap>,
     /// Optional Status of the message. Used mostly for internal handling.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<StatusCode>,
     /// Optional [status][crate::Message::status] description.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
+    /// Length of the message payload, in bytes.
     pub length: usize,
 }
