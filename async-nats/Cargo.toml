@@ -39,7 +39,7 @@ base64 = "0.22"
 tryhard = "0.5"
 ring = { version = "0.17", optional = true }
 rand = "0.8"
-rustls-webpki = { package = "rustls-webpki", default-features = false, version = "0.102" }
+rustls-webpki = { package = "rustls-webpki", default-features = false, version = "0.103.13" }
 portable-atomic = "1"
 tokio-websockets = { version = "0.10", default-features = false, features = ["client", "rand", "rustls-webpki-roots"], optional = true }
 pin-project = "1.0"
@@ -64,7 +64,7 @@ default = ["server_2_10", "server_2_11", "server_2_12", "ring"]
 # Enables Service API for the client.
 service = []
 websockets = ["dep:tokio-websockets"]
-aws-lc-rs = ["dep:aws-lc-rs", "tokio-rustls/aws-lc-rs", "tokio-websockets?/aws-lc-rs", "rustls-webpki/aws_lc_rs"]
+aws-lc-rs = ["dep:aws-lc-rs", "tokio-rustls/aws-lc-rs", "tokio-websockets?/aws-lc-rs", "rustls-webpki/aws-lc-rs"]
 ring = ["dep:ring", "tokio-rustls/ring", "tokio-websockets?/ring"]
 fips = ["aws-lc-rs", "tokio-rustls/fips"]
 # All experimental features are part of this feature flag.
