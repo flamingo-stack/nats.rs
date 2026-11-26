@@ -767,6 +767,40 @@ mod client {
     }
 
     #[tokio::test]
+    async fn auth_url_callback_replaces_the_pool_after_authorization_violation() {
+        let locked = nats_server::run_server("tests/configs/user_pass.conf");
+        let open = nats_server::run_basic_server();
+        let open_url = open.client_url();
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let client = ConnectOptions::new()
+            .retry_on_initial_connect()
+            .event_callback(move |event| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(event).ok();
+                }
+            })
+            .auth_url_callback({
+                let open_url = open_url.clone();
+                move |()| {
+                    let open_url = open_url.clone();
+                    async move { Ok(open_url) }
+                }
+            })
+            .connect(locked.client_url())
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .unwrap();
+        assert_eq!(event, Some(Event::Connected));
+        let pool = client.server_pool().await.unwrap();
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].addr, open_url.parse::<ServerAddr>().unwrap());
+    }
+
+    #[tokio::test]
     async fn connection_callbacks() {
         let server = nats_server::run_basic_server();
         let port = server.client_port().to_string();
