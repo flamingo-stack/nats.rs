@@ -278,12 +278,14 @@ fn tls_asked_by(options: &ConnectorOptions, servers: &[Server]) -> Option<Cow<'s
     }
 }
 
-/// The URL as an error message prints it: with its username and password cleared.
+/// The URL as an error message prints it: with its username, password and query cleared.
 fn without_user_info(addr: &ServerAddr) -> String {
     let mut url = addr.clone().into_inner();
     // Clearing fails only for a URL without a host, which a server URL always has.
     let _ = url.set_username("");
     let _ = url.set_password(None);
+    // A WebSocket gateway can take its token in the query.
+    url.set_query(None);
     url.into()
 }
 
@@ -1678,6 +1680,14 @@ mod tests {
         urls.iter()
             .map(|url| Server::new(url.parse().unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn error_text_drops_credentials_and_query() {
+        let addr: ServerAddr = "wss://user:pass@gw.example:443/ws/nats?authorization=secret"
+            .parse()
+            .unwrap();
+        assert_eq!(without_user_info(&addr), "wss://gw.example/ws/nats");
     }
 
     #[test]
