@@ -854,6 +854,7 @@ impl Connector {
                     // keep only their kind: their text can quote a line from the server, which is
                     // not escaped.
                     ConnectErrorKind::Tls => {
+                        tracing::warn!(error = ?error.to_string(), "connection attempt failed");
                         self.events_tx
                             .try_send(Event::ClientError(ClientError::Other(error.to_string())))
                             .ok();
@@ -864,6 +865,8 @@ impl Connector {
                         {
                             continue;
                         }
+                        // Debug formatting escapes the server line the text can quote.
+                        tracing::warn!(error = ?error.to_string(), "connection attempt failed");
                         self.events_tx
                             .try_send(Event::ClientError(ClientError::Other(other.to_string())))
                             .ok();
