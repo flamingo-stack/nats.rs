@@ -11,21 +11,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "object-store")]
 mod object_store {
     use std::{collections::HashMap, io, time::Duration};
 
     use async_nats::{
         jetstream::{
-            object_store::{AddLinkErrorKind, ObjectMetadata, UpdateMetadata},
+            object_store::{AddLinkErrorKind, InfoErrorKind, ObjectMetadata, UpdateMetadata},
             stream::DirectGetErrorKind,
         },
         HeaderMap,
     };
     use base64::Engine;
     use futures_util::StreamExt;
-    use rand::RngCore;
+    use rand::TryRng;
     use tokio::io::AsyncReadExt;
 
+    use async_nats::jetstream::object_store::ObjectInfo;
     use ring::digest::{self, SHA256};
 
     #[tokio::test]
@@ -43,7 +45,7 @@ mod object_store {
             .await
             .unwrap();
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut bytes = vec![0; 1024 * 1024 + 22];
         rng.try_fill_bytes(&mut bytes).unwrap();
 
@@ -317,6 +319,57 @@ mod object_store {
     }
 
     #[tokio::test]
+    async fn info_uses_direct_get_when_the_stream_allows_it() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+
+        let bucket = jetstream
+            .create_object_store(async_nats::jetstream::object_store::Config {
+                bucket: "bucket".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let api_errors = || async { jetstream.query_account().await.unwrap().requests.errors };
+
+        let before = api_errors().await;
+        bucket
+            .put("NEW", &mut io::Cursor::new(vec![1, 2, 3]))
+            .await
+            .unwrap();
+        let info = bucket.info("NEW").await.unwrap();
+        assert_eq!(info.name, "NEW");
+        let missing = bucket.info("MISSING").await.unwrap_err();
+        assert_eq!(missing.kind(), InfoErrorKind::NotFound);
+        assert_eq!(
+            api_errors().await,
+            before,
+            "lookups on a direct-enabled bucket must not be counted as JetStream API errors"
+        );
+
+        let stream = jetstream.get_stream("OBJ_bucket").await.unwrap();
+        let config = async_nats::jetstream::stream::Config {
+            allow_direct: false,
+            ..stream.cached_info().config.clone()
+        };
+        jetstream.update_stream(config).await.unwrap();
+        let bucket = jetstream.get_object_store("bucket").await.unwrap();
+
+        let before = api_errors().await;
+        let info = bucket.info("NEW").await.unwrap();
+        assert_eq!(info.name, "NEW");
+        let missing = bucket.info("MISSING").await.unwrap_err();
+        assert_eq!(missing.kind(), InfoErrorKind::NotFound);
+        assert_eq!(
+            api_errors().await,
+            before + 1,
+            "without direct get the missing lookup goes through the API and is counted"
+        );
+    }
+
+    #[tokio::test]
     async fn delete() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
         let client = async_nats::connect(server.client_url()).await.unwrap();
@@ -331,7 +384,7 @@ mod object_store {
             .await
             .unwrap();
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut bytes = vec![0; 1024 * 1024 + 22];
         rng.try_fill_bytes(&mut bytes).unwrap();
 
@@ -370,7 +423,7 @@ mod object_store {
             .await
             .unwrap();
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut bytes = vec![0; 1024 * 1024 + 22];
         rng.try_fill_bytes(&mut bytes).unwrap();
 
@@ -712,5 +765,147 @@ mod object_store {
         let mut buffer = Vec::new();
         let result = object.read(&mut buffer).await.unwrap();
         assert_eq!(result, 0);
+    }
+
+    // A failed subscribe must surface as an error on every read, not panic on the retry.
+    #[tokio::test]
+    async fn read_after_a_failed_subscribe_is_an_error_not_a_panic() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+
+        let jetstream = async_nats::jetstream::new(client);
+
+        let bucket = jetstream
+            .create_object_store(async_nats::jetstream::object_store::Config {
+                bucket: "bucket".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        bucket
+            .put("FOO", &mut "some data".as_bytes())
+            .await
+            .unwrap();
+
+        let mut object = bucket.get("FOO").await.unwrap();
+
+        // The consumer is created on the first read; removing the bucket makes that fail.
+        jetstream.delete_object_store("bucket").await.unwrap();
+
+        let mut buffer = [0; 8];
+        object.read(&mut buffer).await.unwrap_err();
+        object.read(&mut buffer).await.unwrap_err();
+    }
+
+    // A timed-out read must surface as `io::ErrorKind::TimedOut`.
+    #[tokio::test]
+    async fn a_timed_out_read_keeps_its_kind() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+
+        // Only the reading client gets a short request timeout.
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+        let jetstream = async_nats::jetstream::new(client);
+
+        let bucket = jetstream
+            .create_object_store(async_nats::jetstream::object_store::Config {
+                bucket: "bucket".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        bucket
+            .put("FOO", &mut "some data".as_bytes())
+            .await
+            .unwrap();
+
+        let impatient = async_nats::jetstream::new(
+            async_nats::ConnectOptions::new()
+                .request_timeout(Some(Duration::from_millis(500)))
+                .connect(server.client_url())
+                .await
+                .unwrap(),
+        );
+        let mut object = impatient
+            .get_object_store("bucket")
+            .await
+            .unwrap()
+            .get("FOO")
+            .await
+            .unwrap();
+
+        // The consumer request sent by the first read times out against a dead server.
+        drop(server);
+
+        let mut buffer = [0; 8];
+        let err = object.read(&mut buffer).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn object_info_header_backward_compatibility() {
+        // Test that ObjectInfo can deserialize both old and new HeaderMap formats
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json");
+        headers.insert("X-Custom", "test-value");
+
+        // Test new format (current format after fix)
+        let object_info_new = ObjectInfo {
+            name: "test-object".to_string(),
+            description: Some("Test object".to_string()),
+            metadata: std::collections::HashMap::new(),
+            headers: Some(headers.clone()),
+            options: None,
+            bucket: "test-bucket".to_string(),
+            nuid: "test-nuid".to_string(),
+            size: 1024,
+            chunks: 1,
+            modified: None,
+            digest: Some("test-digest".to_string()),
+            deleted: false,
+        };
+
+        // Serialize using new format
+        let new_serialized = serde_json::to_string(&object_info_new).unwrap();
+
+        // Should not contain "inner" in headers
+        assert!(!new_serialized.contains(r#""inner":"#));
+
+        // Should deserialize correctly
+        let new_deserialized: ObjectInfo = serde_json::from_str(&new_serialized).unwrap();
+        assert_eq!(object_info_new, new_deserialized);
+
+        // Manually create legacy format (with "inner" wrapper in headers)
+        let legacy_json = new_serialized.replace(
+            r#""headers":{"Content-Type":["application/json"],"X-Custom":["test-value"]}"#,
+            r#""headers":{"inner":{"Content-Type":["application/json"],"X-Custom":["test-value"]}}"#
+        );
+
+        // Legacy format should also deserialize correctly
+        let legacy_deserialized: ObjectInfo = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(object_info_new, legacy_deserialized);
+
+        // Headers should be identical regardless of serialization format
+        assert_eq!(
+            new_deserialized
+                .headers
+                .as_ref()
+                .unwrap()
+                .get("Content-Type"),
+            legacy_deserialized
+                .headers
+                .as_ref()
+                .unwrap()
+                .get("Content-Type")
+        );
+        assert_eq!(
+            new_deserialized.headers.as_ref().unwrap().get("X-Custom"),
+            legacy_deserialized
+                .headers
+                .as_ref()
+                .unwrap()
+                .get("X-Custom")
+        );
     }
 }

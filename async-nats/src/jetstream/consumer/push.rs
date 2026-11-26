@@ -12,8 +12,8 @@
 // limitations under the License.
 
 use super::{
-    backoff, AckPolicy, Consumer, DeliverPolicy, FromConsumer, IntoConsumerConfig, ReplayPolicy,
-    StreamError, StreamErrorKind,
+    backoff, poll_missed_heartbeat, AckPolicy, Consumer, DeliverPolicy, FromConsumer,
+    IntoConsumerConfig, ReplayPolicy, StreamError, StreamErrorKind,
 };
 
 #[cfg(feature = "server_2_11")]
@@ -22,10 +22,12 @@ use super::PriorityPolicy;
 use crate::{
     connection::State,
     error::Error,
-    jetstream::{self, Context, Message},
+    jetstream::{self, response::Response, Context, Message},
     StatusCode, Subscriber,
 };
 
+#[cfg(feature = "server_2_11")]
+use crate::datetime::{rfc3339, DateTime};
 use bytes::Bytes;
 use futures_util::{future::BoxFuture, FutureExt};
 use portable_atomic::AtomicU64;
@@ -39,9 +41,6 @@ use std::{
     sync::Arc,
 };
 use std::{sync::atomic::Ordering, time::Duration};
-#[cfg(feature = "server_2_11")]
-use time::{serde::rfc3339, OffsetDateTime};
-use tokio::{sync::oneshot::error::TryRecvError, task::JoinHandle};
 use tracing::{debug, trace};
 
 const ORDERED_IDLE_HEARTBEAT: Duration = Duration::from_secs(5);
@@ -126,58 +125,45 @@ impl futures_util::Stream for Messages {
     type Item = Result<Message, MessagesError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
-        if !self.config.idle_heartbeat.is_zero() {
-            let heartbeat_sleep = self.config.idle_heartbeat.saturating_mul(2);
-            match self
-                .heartbeat_sleep
-                .get_or_insert_with(|| Box::pin(tokio::time::sleep(heartbeat_sleep)))
-                .poll_unpin(cx)
-            {
-                Poll::Ready(_) => {
-                    self.heartbeat_sleep = None;
-                    return Poll::Ready(Some(Err(MessagesError::new(
-                        MessagesErrorKind::MissingHeartbeat,
-                    ))));
-                }
-                Poll::Pending => (),
-            }
-        }
-        loop {
-            match self.subscriber.receiver.poll_recv(cx) {
-                Poll::Ready(maybe_message) => {
-                    self.heartbeat_sleep = None;
-                    match maybe_message {
-                        Some(message) => match message.status {
-                            Some(StatusCode::IDLE_HEARTBEAT) => {
-                                if let Some(subject) = message.reply {
-                                    // TODO store pending_publish as a future and return errors from it
-                                    let client = self.context.client.clone();
-                                    tokio::task::spawn(async move {
-                                        client
-                                            .publish(subject, Bytes::from_static(b""))
-                                            .await
-                                            .unwrap();
-                                    });
-                                }
+        while let Poll::Ready(maybe_message) = self.subscriber.receiver.poll_recv(cx) {
+            self.heartbeat_sleep = None;
+            match maybe_message {
+                Some(message) => match message.status {
+                    Some(StatusCode::IDLE_HEARTBEAT) => {
+                        if let Some(subject) = message.reply {
+                            // TODO store pending_publish as a future and return errors from it
+                            let client = self.context.client.clone();
+                            tokio::task::spawn(async move {
+                                client
+                                    .publish(subject, Bytes::from_static(b""))
+                                    .await
+                                    .unwrap();
+                            });
+                        }
 
-                                continue;
-                            }
-                            Some(_) => {
-                                continue;
-                            }
-                            None => {
-                                return Poll::Ready(Some(Ok(jetstream::Message {
-                                    context: self.context.clone(),
-                                    message,
-                                })))
-                            }
-                        },
-                        None => return Poll::Ready(None),
+                        continue;
                     }
-                }
-                Poll::Pending => return Poll::Pending,
+                    Some(_) => {
+                        continue;
+                    }
+                    None => {
+                        return Poll::Ready(Some(Ok(jetstream::Message {
+                            context: self.context.clone(),
+                            message,
+                        })))
+                    }
+                },
+                None => return Poll::Ready(None),
             }
         }
+
+        let idle_heartbeat = self.config.idle_heartbeat;
+        if poll_missed_heartbeat(&mut self.heartbeat_sleep, idle_heartbeat, cx) {
+            return Poll::Ready(Some(Err(MessagesError::new(
+                MessagesErrorKind::MissingHeartbeat,
+            ))));
+        }
+        Poll::Pending
     }
 }
 
@@ -237,7 +223,7 @@ pub struct Config {
     /// Whether messages are sent as quickly as possible or at the rate of receipt
     pub replay_policy: ReplayPolicy,
     /// The rate of message delivery in bits per second
-    #[serde(default, skip_serializing_if = "is_default")]
+    #[serde(rename = "rate_limit_bps", default, skip_serializing_if = "is_default")]
     pub rate_limit: u64,
     /// What percentage of acknowledgments should be samples for observability, 0-100
     #[serde(
@@ -271,7 +257,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "is_default")]
     pub memory_storage: bool,
     #[cfg(feature = "server_2_10")]
-    // Additional consumer metadata.
+    /// Additional consumer metadata.
     #[serde(default, skip_serializing_if = "is_default")]
     pub metadata: HashMap<String, String>,
     /// Custom backoff for missed acknowledgments.
@@ -287,7 +273,7 @@ pub struct Config {
         with = "rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
-    pub pause_until: Option<OffsetDateTime>,
+    pub pause_until: Option<DateTime>,
 }
 
 impl FromConsumer for Config {
@@ -368,6 +354,8 @@ impl IntoConsumerConfig for Config {
             #[cfg(feature = "server_2_11")]
             priority_groups: Vec::new(),
             #[cfg(feature = "server_2_11")]
+            priority_timeout: Duration::ZERO,
+            #[cfg(feature = "server_2_11")]
             pause_until: self.pause_until,
         }
     }
@@ -391,6 +379,10 @@ pub struct OrderedConfig {
     pub deliver_subject: String,
     /// A name of the consumer. Can be specified for both durable and ephemeral
     /// consumers.
+    ///
+    /// When the consumer is recreated, the replacement is named `{name}_{n}`,
+    /// where `n` counts the recreates. Without a name, the name the server gave
+    /// the first consumer is used instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// A short description of the purpose of this consumer.
@@ -405,7 +397,7 @@ pub struct OrderedConfig {
     /// Whether messages are sent as quickly as possible or at the rate of receipt
     pub replay_policy: ReplayPolicy,
     /// The rate of message delivery in bits per second
-    #[serde(default, skip_serializing_if = "is_default")]
+    #[serde(rename = "rate_limit_bps", default, skip_serializing_if = "is_default")]
     pub rate_limit: u64,
     /// What percentage of acknowledgments should be samples for observability, 0-100
     #[serde(
@@ -425,7 +417,7 @@ pub struct OrderedConfig {
     #[serde(default, skip_serializing_if = "is_default")]
     pub max_waiting: i64,
     #[cfg(feature = "server_2_10")]
-    // Additional consumer metadata.
+    /// Additional consumer metadata.
     #[serde(default, skip_serializing_if = "is_default")]
     pub metadata: HashMap<String, String>,
 }
@@ -498,6 +490,8 @@ impl IntoConsumerConfig for OrderedConfig {
             #[cfg(feature = "server_2_11")]
             priority_groups: Vec::new(),
             #[cfg(feature = "server_2_11")]
+            priority_timeout: Duration::ZERO,
+            #[cfg(feature = "server_2_11")]
             pause_until: None,
         }
     }
@@ -514,62 +508,22 @@ impl Consumer<OrderedConfig> {
 
         let last_sequence = Arc::new(AtomicU64::new(0));
         let consumer_sequence = Arc::new(AtomicU64::new(0));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::task::spawn({
-            let stream_name = self.info.stream_name.clone();
-            let config = self.config.clone();
-            let mut context = self.context.clone();
-            let last_sequence = last_sequence.clone();
-            let consumer_sequence = consumer_sequence.clone();
-            let state = self.context.client.state.clone();
-            async move {
-                loop {
-                    let current_state = state.borrow().to_owned();
 
-                    context.client.state.changed().await.unwrap();
-                    // State change notification received within the timeout
-                    if state.borrow().to_owned() != State::Connected
-                        || current_state == State::Connected
-                    {
-                        continue;
-                    }
-                    debug!("reconnected. trigger consumer recreation");
-
-                    debug!(
-                        "idle heartbeats expired. recreating consumer s: {},  {:?}",
-                        stream_name, config
-                    );
-                    let consumer = tryhard::retry_fn(|| {
-                        recreate_ephemeral_consumer(
-                            context.clone(),
-                            config.clone(),
-                            stream_name.clone(),
-                            last_sequence.load(Ordering::Relaxed),
-                        )
-                    })
-                    .retries(u32::MAX)
-                    .custom_backoff(backoff)
-                    .await;
-                    if let Err(err) = consumer {
-                        shutdown_tx.send(err).unwrap();
-                        break;
-                    }
-                    debug!("resetting consume sequence to 0");
-                    consumer_sequence.store(0, Ordering::Relaxed);
-                }
-            }
-        });
-
+        let state = self.context.client.state.clone();
         Ok(Ordered {
             context: self.context.clone(),
+            consumer_name: self.info.name.clone(),
+            serial: 0,
             consumer: self,
             subscriber: Some(subscriber),
             subscriber_future: None,
             stream_sequence: last_sequence,
             consumer_sequence,
-            shutdown: shutdown_rx,
-            handle,
             heartbeat_sleep: None,
+            idle_heartbeats: 0,
+            state,
+            last_known_state: State::Connected,
+            state_change_future: None,
         })
     }
 }
@@ -577,19 +531,54 @@ impl Consumer<OrderedConfig> {
 pub struct Ordered {
     context: Context,
     consumer: Consumer<OrderedConfig>,
+    consumer_name: String,
+    serial: u64,
     subscriber: Option<Subscriber>,
     subscriber_future: Option<BoxFuture<'static, Result<Subscriber, ConsumerRecreateError>>>,
     stream_sequence: Arc<AtomicU64>,
     consumer_sequence: Arc<AtomicU64>,
-    shutdown: tokio::sync::oneshot::Receiver<ConsumerRecreateError>,
-    handle: JoinHandle<()>,
     heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// Idle heartbeats received while in sync with the current consumer.
+    idle_heartbeats: u64,
+    state: tokio::sync::watch::Receiver<State>,
+    last_known_state: State,
+    state_change_future:
+        Option<BoxFuture<'static, Result<(), tokio::sync::watch::error::RecvError>>>,
 }
 
-impl Drop for Ordered {
-    fn drop(&mut self) {
-        // Stop trying to recreate the consumer
-        self.handle.abort()
+// Only the KV history and keys streams use these.
+#[cfg_attr(not(feature = "kv"), allow(dead_code))]
+impl Ordered {
+    /// Number of idle heartbeats received while in sync with the current consumer.
+    ///
+    /// The server sends one when a heartbeat interval passes without a delivery.
+    pub(crate) fn idle_heartbeats(&self) -> u64 {
+        self.idle_heartbeats
+    }
+
+    /// Fetches the server's info for the current consumer, to check with
+    /// [`Ordered::delivered_all`].
+    pub(crate) fn consumer_info(&self) -> BoxFuture<'static, Result<super::Info, crate::Error>> {
+        let context = self.context.clone();
+        let subject = format!(
+            "CONSUMER.INFO.{}.{}",
+            self.consumer.info.stream_name, self.consumer_name
+        );
+        Box::pin(async move {
+            match context.request(subject, &serde_json::json!({})).await? {
+                Response::Ok(info) => Ok(info),
+                Response::Err { error } => Err(error.into()),
+            }
+        })
+    }
+
+    /// Whether `info`, fetched for the current consumer, shows nothing left to deliver and every
+    /// delivered message already received.
+    pub(crate) fn delivered_all(&self, info: &super::Info) -> bool {
+        self.subscriber.is_some()
+            && info.name == self.consumer_name
+            && info.num_pending == 0
+            && info.delivered.consumer_sequence == self.consumer_sequence.load(Ordering::Relaxed)
     }
 }
 
@@ -597,171 +586,221 @@ impl futures_util::Stream for Ordered {
     type Item = Result<Message, OrderedError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
-        match self
-            .heartbeat_sleep
-            .get_or_insert_with(|| {
-                Box::pin(tokio::time::sleep(ORDERED_IDLE_HEARTBEAT.saturating_mul(2)))
-            })
-            .poll_unpin(cx)
-        {
-            Poll::Ready(_) => {
-                self.heartbeat_sleep = None;
-                return Poll::Ready(Some(Err(OrderedError::new(
-                    OrderedErrorKind::MissingHeartbeat,
-                ))));
-            }
-            Poll::Pending => (),
-        }
-
         loop {
-            match self.shutdown.try_recv() {
-                Ok(err) => {
-                    return Poll::Ready(Some(Err(OrderedError::with_source(
-                        OrderedErrorKind::Other,
-                        err,
-                    ))))
-                }
-                Err(TryRecvError::Closed) => {
-                    return Poll::Ready(Some(Err(OrderedError::with_source(
-                        OrderedErrorKind::Other,
-                        "consumer task closed",
-                    ))))
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-            if self.subscriber.is_none() {
-                match self.subscriber_future.as_mut() {
-                    None => {
-                        trace!(
-                            "subscriber and subscriber future are None. Recreating the consumer"
-                        );
-                        let context = self.context.clone();
-                        let sequence = self.stream_sequence.clone();
-                        let config = self.consumer.config.clone();
-                        let stream_name = self.consumer.info.stream_name.clone();
-                        let subscriber_future =
-                            self.subscriber_future.insert(Box::pin(async move {
-                                recreate_consumer_and_subscription(
-                                    context,
-                                    config,
-                                    stream_name,
-                                    sequence.load(Ordering::Relaxed),
-                                )
-                                .await
-                            }));
-                        match subscriber_future.as_mut().poll(cx) {
-                            Poll::Ready(subscriber) => {
-                                self.subscriber_future = None;
+            // Poll for connection state changes
+            match &mut self.state_change_future {
+                None => {
+                    // Check if state has already changed
+                    if self.state.has_changed().unwrap_or(false) {
+                        let current_state = self.state.borrow_and_update().clone();
+
+                        // Handle state transitions
+                        use State::*;
+                        match (&self.last_known_state, &current_state) {
+                            (Connected, Disconnected | Pending) => {
+                                debug!("Connection lost, marking subscriber as invalid");
+                                self.subscriber = None;
+                                self.heartbeat_sleep = None;
+                            }
+                            (Disconnected | Pending, Connected) => {
+                                debug!("Connection restored, triggering consumer recreation");
+                                self.subscriber = None;
                                 self.consumer_sequence.store(0, Ordering::Relaxed);
-                                self.subscriber = Some(subscriber.map_err(|err| {
-                                    OrderedError::with_source(OrderedErrorKind::Recreate, err)
-                                })?);
+                                self.heartbeat_sleep = None;
                             }
-                            Poll::Pending => {
-                                return Poll::Pending;
-                            }
+                            _ => {}
                         }
+
+                        self.last_known_state = current_state;
+                    } else {
+                        // Create a future to wait for state changes
+                        let mut state = self.state.clone();
+                        self.state_change_future =
+                            Some(Box::pin(async move { state.changed().await }));
                     }
-                    Some(subscriber) => match subscriber.as_mut().poll(cx) {
-                        Poll::Ready(subscriber) => {
+                }
+                Some(fut) => match fut.poll_unpin(cx) {
+                    Poll::Ready(Ok(())) => {
+                        self.state_change_future = None;
+                        continue; // State changed, restart loop to check it
+                    }
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Some(Err(OrderedError::with_source(
+                            OrderedErrorKind::Other,
+                            "Connection state watcher dropped",
+                        ))));
+                    }
+                    Poll::Pending => {}
+                },
+            }
+
+            // Handle messages after checking connection state
+
+            // Handle subscriber recreation if needed
+            if self.subscriber.is_none() {
+                // Ensure we have a recreation future
+                if self.subscriber_future.is_none() {
+                    trace!("Creating subscriber recreation future");
+                    self.serial += 1;
+                    let name = format!("{}_{}", self.consumer.info.name, self.serial);
+                    let consumer_name = std::mem::replace(&mut self.consumer_name, name.clone());
+                    let context = self.context.clone();
+                    let sequence = self.stream_sequence.clone();
+                    let config = OrderedConfig {
+                        name: Some(name),
+                        ..self.consumer.config.clone()
+                    };
+                    let stream_name = self.consumer.info.stream_name.clone();
+
+                    self.subscriber_future = Some(Box::pin(async move {
+                        tryhard::retry_fn(|| {
+                            recreate_consumer_and_subscription(
+                                context.clone(),
+                                config.clone(),
+                                stream_name.clone(),
+                                consumer_name.clone(),
+                                sequence.load(Ordering::Relaxed),
+                            )
+                        })
+                        .retries(u32::MAX)
+                        .custom_backoff(backoff)
+                        .await
+                        .map_err(|err| {
+                            ConsumerRecreateError::with_source(
+                                ConsumerRecreateErrorKind::Recreate,
+                                err,
+                            )
+                        })
+                    }));
+                }
+
+                // Poll the recreation future
+                if let Some(fut) = &mut self.subscriber_future {
+                    match fut.poll_unpin(cx) {
+                        Poll::Ready(result) => {
                             self.subscriber_future = None;
                             self.consumer_sequence.store(0, Ordering::Relaxed);
-                            self.subscriber = Some(subscriber.map_err(|err| {
+                            self.subscriber = Some(result.map_err(|err| {
                                 OrderedError::with_source(OrderedErrorKind::Recreate, err)
                             })?);
                         }
-                        Poll::Pending => {
-                            return Poll::Pending;
-                        }
-                    },
+                        Poll::Pending => return Poll::Pending,
+                    }
                 }
             }
+            // Poll for messages
             if let Some(subscriber) = self.subscriber.as_mut() {
                 match subscriber.receiver.poll_recv(cx) {
-                    Poll::Ready(maybe_message) => match maybe_message {
-                        Some(message) => {
-                            self.heartbeat_sleep = None;
-                            match message.status {
-                                Some(StatusCode::IDLE_HEARTBEAT) => {
-                                    debug!("received idle heartbeats");
-                                    if let Some(headers) = message.headers.as_ref() {
-                                        if let Some(sequence) =
-                                            headers.get_last(crate::header::NATS_LAST_CONSUMER)
-                                        {
-                                            let sequence: u64 =
-                                                sequence.as_str().parse().map_err(|err| {
-                                                    OrderedError::with_source(
-                                                        OrderedErrorKind::Other,
-                                                        err,
-                                                    )
-                                                })?;
+                    Poll::Ready(None) => return Poll::Ready(None),
+                    Poll::Ready(Some(message)) => {
+                        self.heartbeat_sleep = None;
+                        match message.status {
+                            Some(StatusCode::IDLE_HEARTBEAT) => {
+                                debug!("received idle heartbeats");
+                                if let Some(headers) = message.headers.as_ref() {
+                                    if let Some(sequence) =
+                                        headers.get_last(crate::header::NATS_LAST_CONSUMER)
+                                    {
+                                        let sequence: u64 =
+                                            sequence.as_str().parse().map_err(|err| {
+                                                OrderedError::with_source(
+                                                    OrderedErrorKind::Other,
+                                                    err,
+                                                )
+                                            })?;
 
-                                            let last_sequence =
-                                                self.consumer_sequence.load(Ordering::Relaxed);
+                                        let last_sequence =
+                                            self.consumer_sequence.load(Ordering::Relaxed);
 
-                                            if sequence != last_sequence {
-                                                debug!("hearbeats sequence mismatch. got {}, expected {}, resetting consumer", sequence, last_sequence);
-                                                self.subscriber = None;
-                                            }
+                                        if sequence != last_sequence {
+                                            debug!("hearbeats sequence mismatch. got {}, expected {}, resetting consumer", sequence, last_sequence);
+                                            self.subscriber = None;
+                                            self.heartbeat_sleep = None;
                                         }
                                     }
-                                    // flow control.
-                                    if let Some(subject) = message.reply.clone() {
-                                        trace!("received flow control message");
-                                        let client = self.context.client.clone();
-                                        tokio::task::spawn(async move {
-                                            client
-                                                .publish(subject, Bytes::from_static(b""))
-                                                .await
-                                                .ok();
-                                        });
-                                    }
-                                    continue;
                                 }
-                                Some(status) => {
-                                    debug!("received status message: {}", status);
-                                    continue;
+                                // Flow control requests carry a reply subject, idle heartbeats do
+                                // not.
+                                if message.reply.is_none() && self.subscriber.is_some() {
+                                    self.idle_heartbeats += 1;
                                 }
-                                None => {
-                                    trace!("received a message");
-                                    let jetstream_message = jetstream::message::Message {
-                                        message,
-                                        context: self.context.clone(),
-                                    };
+                                // flow control.
+                                if let Some(subject) = message.reply.clone() {
+                                    trace!("received flow control message");
+                                    let client = self.context.client.clone();
+                                    tokio::task::spawn(async move {
+                                        client.publish(subject, Bytes::from_static(b"")).await.ok();
+                                    });
+                                }
+                                continue;
+                            }
+                            Some(status) => {
+                                debug!("received status message: {}", status);
+                                continue;
+                            }
+                            None => {
+                                trace!("received a message");
+                                let jetstream_message = jetstream::message::Message {
+                                    message,
+                                    context: self.context.clone(),
+                                };
 
-                                    let info = jetstream_message.info().map_err(|err| {
-                                        OrderedError::with_source(OrderedErrorKind::Other, err)
-                                    })?;
-                                    trace!("consumer sequence: {:?}, stream sequence {:?}, consumer sequence in message: {:?} stream sequence in message: {:?}",
+                                let info = jetstream_message.info().map_err(|err| {
+                                    OrderedError::with_source(OrderedErrorKind::Other, err)
+                                })?;
+                                trace!("consumer sequence: {:?}, stream sequence {:?}, consumer sequence in message: {:?} stream sequence in message: {:?}",
                                                self.consumer_sequence,
                                                self.stream_sequence,
                                                info.consumer_sequence,
                                                info.stream_sequence);
-                                    if info.consumer_sequence
-                                        != self.consumer_sequence.load(Ordering::Relaxed) + 1
-                                    {
-                                        debug!(
-                                            "ordered consumer mismatch. current {}, info: {}",
-                                            self.consumer_sequence.load(Ordering::Relaxed),
-                                            info.consumer_sequence
-                                        );
-                                        self.subscriber = None;
-                                        self.consumer_sequence.store(0, Ordering::Relaxed);
-                                        continue;
-                                    }
-                                    self.stream_sequence
-                                        .store(info.stream_sequence, Ordering::Relaxed);
-                                    self.consumer_sequence
-                                        .store(info.consumer_sequence, Ordering::Relaxed);
-                                    return Poll::Ready(Some(Ok(jetstream_message)));
+                                if info.consumer_sequence
+                                    != self.consumer_sequence.load(Ordering::Relaxed) + 1
+                                {
+                                    debug!(
+                                        "ordered consumer mismatch. current {}, info: {}",
+                                        self.consumer_sequence.load(Ordering::Relaxed),
+                                        info.consumer_sequence
+                                    );
+                                    self.subscriber = None;
+                                    self.consumer_sequence.store(0, Ordering::Relaxed);
+                                    self.heartbeat_sleep = None;
+                                    continue;
                                 }
+                                self.stream_sequence
+                                    .store(info.stream_sequence, Ordering::Relaxed);
+                                self.consumer_sequence
+                                    .store(info.consumer_sequence, Ordering::Relaxed);
+                                return Poll::Ready(Some(Ok(jetstream_message)));
                             }
                         }
-                        None => {
-                            return Poll::Ready(None);
+                    }
+                    Poll::Pending => {
+                        // The channel is drained. Only now consult the idle-heartbeat timer: a
+                        // live consumer keeps sending heartbeats well within the timeout, so an
+                        // empty channel past the deadline means the consumer is gone (e.g. the
+                        // server was restarted, or the consumer was deleted, while this stream
+                        // was idle). Recreate from the last delivered sequence instead of
+                        // erroring terminally and then hanging forever (#1596).
+                        //
+                        // Draining before this check is what makes it safe: if the application
+                        // merely paused while messages were still buffered, those are delivered
+                        // first (each resetting the timer), so a false timeout never discards
+                        // buffered messages. That matters because recreation resumes from the
+                        // last *delivered* sequence (AckPolicy::None), and on capped/discarding
+                        // streams the dropped messages might no longer be replayable.
+                        if poll_missed_heartbeat(
+                            &mut self.heartbeat_sleep,
+                            ORDERED_IDLE_HEARTBEAT,
+                            cx,
+                        ) {
+                            self.subscriber = None;
+                            self.consumer_sequence.store(0, Ordering::Relaxed);
+                            return Poll::Ready(Some(Err(OrderedError::new(
+                                OrderedErrorKind::MissingHeartbeat,
+                            ))));
                         }
-                    },
-                    Poll::Pending => return Poll::Pending,
+                        return Poll::Pending;
+                    }
                 }
             }
         }
@@ -857,8 +896,16 @@ async fn recreate_consumer_and_subscription(
     context: Context,
     mut config: OrderedConfig,
     stream_name: String,
+    consumer_name: String,
     sequence: u64,
 ) -> Result<Subscriber, ConsumerRecreateError> {
+    let context = context.recovery_context();
+    trace!("delete old consumer before creating new one");
+    context
+        .delete_consumer_from_stream(&consumer_name, &stream_name)
+        .await
+        .ok();
+
     let delivery_subject = context.client.new_inbox();
     config.deliver_subject = delivery_subject;
 
@@ -879,14 +926,6 @@ async fn recreate_ephemeral_consumer(
     stream_name: String,
     sequence: u64,
 ) -> Result<(), ConsumerRecreateError> {
-    let stream = tryhard::retry_fn(|| context.get_stream(stream_name.clone()))
-        .retries(u32::MAX)
-        .custom_backoff(backoff)
-        .await
-        .map_err(|err| {
-            ConsumerRecreateError::with_source(ConsumerRecreateErrorKind::GetStream, err)
-        })?;
-
     let deliver_policy = {
         if sequence == 0 {
             DeliverPolicy::All
@@ -897,21 +936,18 @@ async fn recreate_ephemeral_consumer(
         }
     };
 
-    tryhard::retry_fn(|| {
-        let config = config.clone();
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            stream.create_consumer(jetstream::consumer::push::OrderedConfig {
+    context
+        .create_consumer_on_stream(
+            jetstream::consumer::push::OrderedConfig {
                 deliver_policy,
                 ..config
-            }),
+            },
+            stream_name,
         )
-    })
-    .retries(u32::MAX)
-    .custom_backoff(backoff)
-    .await
-    .map_err(|_| ConsumerRecreateError::new(ConsumerRecreateErrorKind::TimedOut))?
-    .map_err(|err| ConsumerRecreateError::with_source(ConsumerRecreateErrorKind::Recreate, err))?;
+        .await
+        .map_err(|err| {
+            ConsumerRecreateError::with_source(ConsumerRecreateErrorKind::Recreate, err)
+        })?;
 
     Ok(())
 }

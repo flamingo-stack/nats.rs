@@ -10,7 +10,6 @@ This file lists the dependencies used in this repository.
 | memchr 2.6.3              | MIT OR Unlicense         |
 | nkeys 0.3.2               | Apache-2.0               |
 | nuid 0.5.0                | Apache-2.0               |
-| once_cell 1.18.0          | Apache-2.0 OR MIT        |
 | rand 0.8.5                | Apache-2.0 OR MIT        |
 | regex 1.9.5               | Apache-2.0 OR MIT        |
 | ring 0.16.20              | MIT AND ISC AND OpenSSL  |
@@ -22,6 +21,7 @@ This file lists the dependencies used in this repository.
 | serde_json 1.0.107        | Apache-2.0 OR MIT        |
 | serde_nanos 0.1.3         | Apache-2.0 OR MIT        |
 | serde_repr 0.1.16         | Apache-2.0 OR MIT        |
+| sha1_smol (optional)      | BSD-3-Clause             |
 | thiserror 1.0.48          | Apache-2.0 OR MIT        |
 | time 0.3.29               | Apache-2.0 OR MIT        |
 | tokio 1.32.0              | MIT                      |
@@ -29,7 +29,6 @@ This file lists the dependencies used in this repository.
 | tokio-rustls 0.24.1       | Apache-2.0 OR MIT        |
 | tracing 0.1.37            | MIT                      |
 | url 2.4.1                 | Apache-2.0 OR MIT        |
-| webpki-roots (optional)   | CDLA-Permissive-2.0      |
 
 ## Dev dependencies (tests, examples, benchmarks)
 

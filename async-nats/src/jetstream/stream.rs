@@ -17,23 +17,20 @@ use std::{
     collections::{self, HashMap},
     fmt::{self, Debug, Display},
     future::IntoFuture,
-    io::{self},
     pin::Pin,
     str::FromStr,
     task::Poll,
     time::Duration,
 };
 
-use crate::{
-    error::Error, header::HeaderName, is_valid_subject, HeaderMap, HeaderValue, StatusCode,
-};
+use crate::datetime::{rfc3339, DateTime};
+use crate::{error::Error, header::HeaderName, is_valid_subject, HeaderMap, StatusCode};
 use base64::engine::general_purpose::STANDARD;
 use base64::engine::Engine;
 use bytes::Bytes;
 use futures_util::{future::BoxFuture, FutureExt, TryFutureExt};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
-use time::{serde::rfc3339, OffsetDateTime};
 
 use super::{
     consumer::{self, Consumer, FromConsumer, IntoConsumerConfig},
@@ -45,7 +42,7 @@ use super::{
     is_valid_name,
     message::{StreamMessage, StreamMessageError},
     response::Response,
-    Context, Message,
+    Context,
 };
 
 pub type InfoError = RequestError;
@@ -80,14 +77,18 @@ pub type DirectGetError = Error<DirectGetErrorKind>;
 impl From<crate::RequestError> for DirectGetError {
     fn from(err: crate::RequestError) -> Self {
         match err.kind() {
-            crate::RequestErrorKind::TimedOut => DirectGetError::new(DirectGetErrorKind::TimedOut),
+            crate::RequestErrorKind::TimedOut => {
+                DirectGetError::with_source(DirectGetErrorKind::TimedOut, err)
+            }
             crate::RequestErrorKind::NoResponders => {
                 DirectGetError::new(DirectGetErrorKind::ErrorResponse(
                     StatusCode::NO_RESPONDERS,
                     "no responders".to_string(),
                 ))
             }
-            crate::RequestErrorKind::Other => {
+            crate::RequestErrorKind::InvalidSubject
+            | crate::RequestErrorKind::MaxPayloadExceeded
+            | crate::RequestErrorKind::Other => {
                 DirectGetError::with_source(DirectGetErrorKind::Other, err)
             }
         }
@@ -273,10 +274,33 @@ impl<I> Stream<I> {
         StreamInfoBuilder::new(self.context.clone(), self.name.clone())
     }
 
+    /// Creates a builder for direct get operations.
+    ///
+    /// Allows for more control over direct get requests.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// let client = async_nats::connect("demo.nats.io").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    ///
+    /// let stream = jetstream.get_stream("events").await?;
+    ///
+    /// // Get message without headers
+    /// let message = stream.direct_get_builder().sequence(100).send().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn direct_get_builder(&self) -> DirectGetBuilder<WithHeaders> {
+        DirectGetBuilder::new(self.context.clone(), self.name.clone())
+    }
+
     /// Gets next message for a [Stream].
     ///
     /// Requires a [Stream] with `allow_direct` set to `true`.
-    /// This is different from [Stream::get_raw_message], as it can fetch [Message]
+    /// This is different from [Stream::get_raw_message], as it can fetch [super::message::StreamMessage]
     /// from any replica member. This means read after write is possible,
     /// as that given replica might not yet catch up with the leader.
     ///
@@ -307,66 +331,28 @@ impl<I> Stream<I> {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn direct_get_next_for_subject<T: AsRef<str>>(
+    pub async fn direct_get_next_for_subject<T: Into<String>>(
         &self,
         subject: T,
         sequence: Option<u64>,
-    ) -> Result<Message, DirectGetError> {
-        if !is_valid_subject(&subject) {
+    ) -> Result<StreamMessage, DirectGetError> {
+        let subject_str = subject.into();
+        if !is_valid_subject(&subject_str) {
             return Err(DirectGetError::new(DirectGetErrorKind::InvalidSubject));
         }
-        let request_subject = format!("{}.DIRECT.GET.{}", &self.context.prefix, &self.name);
-        let payload;
-        if let Some(sequence) = sequence {
-            payload = json!({
-                "seq": sequence,
-                "next_by_subj": subject.as_ref(),
-            });
-        } else {
-            payload = json!({
-                 "next_by_subj": subject.as_ref(),
-            });
+
+        let mut builder = self.direct_get_builder().next_by_subject(subject_str);
+        if let Some(seq) = sequence {
+            builder = builder.sequence(seq);
         }
 
-        let response = self
-            .context
-            .client
-            .request(
-                request_subject,
-                serde_json::to_vec(&payload).map(Bytes::from)?,
-            )
-            .await
-            .map(|message| Message {
-                message,
-                context: self.context.clone(),
-            })?;
-
-        if let Some(status) = response.status {
-            if let Some(ref description) = response.description {
-                match status {
-                    StatusCode::NOT_FOUND => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::NotFound))
-                    }
-                    // 408 is used in Direct Message for bad/empty payload.
-                    StatusCode::TIMEOUT => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::InvalidSubject))
-                    }
-                    _ => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::ErrorResponse(
-                            status,
-                            description.to_string(),
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(response)
+        builder.send().await
     }
 
     /// Gets first message from [Stream].
     ///
     /// Requires a [Stream] with `allow_direct` set to `true`.
-    /// This is different from [Stream::get_raw_message], as it can fetch [Message]
+    /// This is different from [Stream::get_raw_message], as it can fetch [super::message::StreamMessage]
     /// from any replica member. This means read after write is possible,
     /// as that given replica might not yet catch up with the leader.
     ///
@@ -394,56 +380,25 @@ impl<I> Stream<I> {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn direct_get_first_for_subject<T: AsRef<str>>(
+    pub async fn direct_get_first_for_subject<T: Into<String>>(
         &self,
         subject: T,
-    ) -> Result<Message, DirectGetError> {
-        if !is_valid_subject(&subject) {
+    ) -> Result<StreamMessage, DirectGetError> {
+        let subject_str = subject.into();
+        if !is_valid_subject(&subject_str) {
             return Err(DirectGetError::new(DirectGetErrorKind::InvalidSubject));
         }
-        let request_subject = format!("{}.DIRECT.GET.{}", &self.context.prefix, &self.name);
-        let payload = json!({
-            "next_by_subj": subject.as_ref(),
-        });
 
-        let response = self
-            .context
-            .client
-            .request(
-                request_subject,
-                serde_json::to_vec(&payload).map(Bytes::from)?,
-            )
+        self.direct_get_builder()
+            .next_by_subject(subject_str)
+            .send()
             .await
-            .map(|message| Message {
-                message,
-                context: self.context.clone(),
-            })?;
-        if let Some(status) = response.status {
-            if let Some(ref description) = response.description {
-                match status {
-                    StatusCode::NOT_FOUND => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::NotFound))
-                    }
-                    // 408 is used in Direct Message for bad/empty payload.
-                    StatusCode::TIMEOUT => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::InvalidSubject))
-                    }
-                    _ => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::ErrorResponse(
-                            status,
-                            description.to_string(),
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(response)
     }
 
     /// Gets message from [Stream] with given `sequence id`.
     ///
     /// Requires a [Stream] with `allow_direct` set to `true`.
-    /// This is different from [Stream::get_raw_message], as it can fetch [Message]
+    /// This is different from [Stream::get_raw_message], as it can fetch [super::message::StreamMessage]
     /// from any replica member. This means read after write is possible,
     /// as that given replica might not yet catch up with the leader.
     ///
@@ -472,43 +427,13 @@ impl<I> Stream<I> {
     /// # }
     /// ```
     pub async fn direct_get(&self, sequence: u64) -> Result<StreamMessage, DirectGetError> {
-        let subject = format!("{}.DIRECT.GET.{}", &self.context.prefix, &self.name);
-        let payload = json!({
-            "seq": sequence,
-        });
-
-        let response = self
-            .context
-            .client
-            .request(subject, serde_json::to_vec(&payload).map(Bytes::from)?)
-            .await?;
-
-        if let Some(status) = response.status {
-            if let Some(ref description) = response.description {
-                match status {
-                    StatusCode::NOT_FOUND => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::NotFound))
-                    }
-                    // 408 is used in Direct Message for bad/empty payload.
-                    StatusCode::TIMEOUT => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::InvalidSubject))
-                    }
-                    _ => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::ErrorResponse(
-                            status,
-                            description.to_string(),
-                        )));
-                    }
-                }
-            }
-        }
-        StreamMessage::try_from(response).map_err(Into::into)
+        self.direct_get_builder().sequence(sequence).send().await
     }
 
     /// Gets last message for a given `subject`.
     ///
     /// Requires a [Stream] with `allow_direct` set to `true`.
-    /// This is different from [Stream::get_raw_message], as it can fetch [Message]
+    /// This is different from [Stream::get_raw_message], as it can fetch [super::message::StreamMessage]
     /// from any replica member. This means read after write is possible,
     /// as that given replica might not yet catch up with the leader.
     ///
@@ -536,39 +461,38 @@ impl<I> Stream<I> {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn direct_get_last_for_subject<T: AsRef<str>>(
+    pub async fn direct_get_last_for_subject<T: Into<String>>(
         &self,
         subject: T,
     ) -> Result<StreamMessage, DirectGetError> {
-        let subject = format!(
-            "{}.DIRECT.GET.{}.{}",
-            &self.context.prefix,
-            &self.name,
-            subject.as_ref()
-        );
-
-        let response = self.context.client.request(subject, "".into()).await?;
-        if let Some(status) = response.status {
-            if let Some(ref description) = response.description {
-                match status {
-                    StatusCode::NOT_FOUND => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::NotFound))
-                    }
-                    // 408 is used in Direct Message for bad/empty payload.
-                    StatusCode::TIMEOUT => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::InvalidSubject))
-                    }
-                    _ => {
-                        return Err(DirectGetError::new(DirectGetErrorKind::ErrorResponse(
-                            status,
-                            description.to_string(),
-                        )));
-                    }
-                }
-            }
-        }
-        StreamMessage::try_from(response).map_err(Into::into)
+        self.direct_get_builder()
+            .last_by_subject(subject)
+            .send()
+            .await
     }
+    /// Creates a builder for retrieving messages from the stream with flexible options.
+    /// Raw message methods retrieve messages directly from the stream leader instead
+    /// of a replica. This should be used with care, as it can put additional load on the
+    /// stream leader.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// let client = async_nats::connect("localhost:4222").await?;
+    /// let context = async_nats::jetstream::new(client);
+    /// let stream = context.get_stream("events").await?;
+    ///
+    /// // Get message without headers
+    /// let value = stream.raw_message_builder().sequence(100).send().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn raw_message_builder(&self) -> RawMessageBuilder<WithHeaders> {
+        RawMessageBuilder::new(self.context.clone(), self.name.clone())
+    }
+
     /// Get a raw message from the stream for a given stream sequence.
     /// This low-level API always reaches stream leader.
     /// This should be discouraged in favor of using [Stream::direct_get].
@@ -599,12 +523,7 @@ impl<I> Stream<I> {
     /// # }
     /// ```
     pub async fn get_raw_message(&self, sequence: u64) -> Result<StreamMessage, RawMessageError> {
-        self.raw_message(StreamGetMessage {
-            sequence: Some(sequence),
-            last_by_subject: None,
-            next_by_subject: None,
-        })
-        .await
+        self.raw_message_builder().sequence(sequence).send().await
     }
 
     /// Get a first message from the stream for a given subject starting from provided sequence.
@@ -635,12 +554,11 @@ impl<I> Stream<I> {
         subject: T,
         sequence: u64,
     ) -> Result<StreamMessage, RawMessageError> {
-        self.raw_message(StreamGetMessage {
-            sequence: Some(sequence),
-            last_by_subject: None,
-            next_by_subject: Some(subject.as_ref().to_string()),
-        })
-        .await
+        self.raw_message_builder()
+            .sequence(sequence)
+            .next_by_subject(subject.as_ref().to_string())
+            .send()
+            .await
     }
 
     /// Get a next message from the stream for a given subject.
@@ -670,49 +588,10 @@ impl<I> Stream<I> {
         &self,
         subject: T,
     ) -> Result<StreamMessage, RawMessageError> {
-        self.raw_message(StreamGetMessage {
-            sequence: None,
-            last_by_subject: None,
-            next_by_subject: Some(subject.as_ref().to_string()),
-        })
-        .await
-    }
-
-    async fn raw_message(
-        &self,
-        request: StreamGetMessage,
-    ) -> Result<StreamMessage, RawMessageError> {
-        for subject in [&request.last_by_subject, &request.next_by_subject]
-            .into_iter()
-            .flatten()
-        {
-            if !is_valid_subject(subject) {
-                return Err(RawMessageError::new(RawMessageErrorKind::InvalidSubject));
-            }
-        }
-        let subject = format!("STREAM.MSG.GET.{}", &self.name);
-
-        let response: Response<GetRawMessage> = self
-            .context
-            .request(subject, &request)
-            .map_err(|err| LastRawMessageError::with_source(LastRawMessageErrorKind::Other, err))
-            .await?;
-
-        match response {
-            Response::Err { error } => {
-                if error.error_code() == ErrorCode::NO_MESSAGE_FOUND {
-                    Err(LastRawMessageError::new(
-                        LastRawMessageErrorKind::NoMessageFound,
-                    ))
-                } else {
-                    Err(LastRawMessageError::new(
-                        LastRawMessageErrorKind::JetStream(error),
-                    ))
-                }
-            }
-            Response::Ok(value) => StreamMessage::try_from(value.message)
-                .map_err(|err| RawMessageError::with_source(RawMessageErrorKind::Other, err)),
-        }
+        self.raw_message_builder()
+            .next_by_subject(subject.as_ref().to_string())
+            .send()
+            .await
     }
 
     /// Get a last message from the stream for a given subject.
@@ -742,12 +621,10 @@ impl<I> Stream<I> {
         &self,
         stream_subject: &str,
     ) -> Result<StreamMessage, LastRawMessageError> {
-        self.raw_message(StreamGetMessage {
-            sequence: None,
-            last_by_subject: Some(stream_subject.to_string()),
-            next_by_subject: None,
-        })
-        .await
+        self.raw_message_builder()
+            .last_by_subject(stream_subject.to_string())
+            .send()
+            .await
     }
 
     /// Delete a message from the stream.
@@ -774,7 +651,7 @@ impl<I> Stream<I> {
     /// # }
     /// ```
     pub async fn delete_message(&self, sequence: u64) -> Result<bool, DeleteMessageError> {
-        let subject = format!("STREAM.MSG.DELETE.{}", &self.name);
+        let subject = format!("STREAM.MSG.DELETE.{}", self.name);
         let payload = json!({
             "seq": sequence,
         });
@@ -1096,8 +973,9 @@ impl<I> Stream<I> {
     /// use futures_util::StreamExt;
     /// let client = async_nats::connect("localhost:4222").await?;
     /// let jetstream = async_nats::jetstream::new(client);
+    /// use async_nats::datetime;
     /// let pause_until =
-    ///     time::OffsetDateTime::now_utc().saturating_add(time::Duration::seconds_f32(10.0));
+    ///     datetime::add_std_duration(datetime::now(), std::time::Duration::from_secs(10))?;
     ///
     /// jetstream
     ///     .get_stream("events")
@@ -1111,7 +989,7 @@ impl<I> Stream<I> {
     pub async fn pause_consumer(
         &self,
         name: &str,
-        pause_until: OffsetDateTime,
+        pause_until: DateTime,
     ) -> Result<PauseResponse, ConsumerError> {
         self.request_pause_consumer(name, Some(pause_until)).await
     }
@@ -1141,17 +1019,108 @@ impl<I> Stream<I> {
         self.request_pause_consumer(name, None).await
     }
 
+    /// Releases the pinned client of a
+    /// [`PriorityPolicy::PinnedClient`][crate::jetstream::consumer::PriorityPolicy::PinnedClient]
+    /// [Consumer], so the server pins another client pulling from it.
+    ///
+    /// The server keeps one pin per consumer, so naming any of the consumer's priority groups
+    /// releases it; `group` must name one of them.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// let client = async_nats::connect("localhost:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    ///
+    /// jetstream
+    ///     .get_stream("events")
+    ///     .await?
+    ///     .unpin_consumer("my_consumer", "A")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "server_2_11")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server_2_11")))]
+    pub async fn unpin_consumer(&self, name: &str, group: &str) -> Result<(), ConsumerError> {
+        if !is_valid_name(name) {
+            return Err(ConsumerError::new(ConsumerErrorKind::InvalidName));
+        }
+
+        let subject = format!("CONSUMER.UNPIN.{}.{}", self.name, name);
+
+        match self
+            .context
+            .request(subject, &json!({ "group": group }))
+            .await?
+        {
+            Response::Ok::<serde::de::IgnoredAny>(_) => Ok(()),
+            Response::Err { error } => Err(error.into()),
+        }
+    }
+
     #[cfg(feature = "server_2_11")]
     async fn request_pause_consumer(
         &self,
         name: &str,
-        pause_until: Option<OffsetDateTime>,
+        pause_until: Option<DateTime>,
     ) -> Result<PauseResponse, ConsumerError> {
         let subject = format!("CONSUMER.PAUSE.{}.{}", self.name, name);
         let payload = &PauseResumeConsumerRequest { pause_until };
 
         match self.context.request(subject, payload).await? {
             Response::Ok::<PauseResponse>(resp) => Ok(resp),
+            Response::Err { error } => Err(error.into()),
+        }
+    }
+
+    /// Reset a [Consumer]'s delivery state (ADR-60).
+    ///
+    /// `seq` semantics:
+    /// - `None` (or `Some(0)`): reset back to the consumer's ack floor.
+    ///   Pending and redelivered messages are cleared; the ack-floor stream
+    ///   sequence is left where it was.
+    /// - `Some(n)` with `n > 0`: ack-floor stream sequence is set to one
+    ///   below `n`; the next delivered message will have a stream sequence
+    ///   of at least `n`.
+    ///
+    /// Only valid on consumers with
+    /// [`DeliverPolicy::All`][crate::jetstream::consumer::DeliverPolicy::All],
+    /// [`DeliverPolicy::ByStartSequence`][crate::jetstream::consumer::DeliverPolicy::ByStartSequence],
+    /// or
+    /// [`DeliverPolicy::ByStartTime`][crate::jetstream::consumer::DeliverPolicy::ByStartTime].
+    /// For policies with a configured starting sequence/time, resets below
+    /// the configured start are rejected by the server.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// let client = async_nats::connect("localhost:4222").await?;
+    /// let jetstream = async_nats::jetstream::new(client);
+    ///
+    /// let stream = jetstream.get_stream("events").await?;
+    /// stream.reset_consumer("processor", Some(42)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "server_2_14")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server_2_14")))]
+    pub async fn reset_consumer(
+        &self,
+        name: &str,
+        seq: Option<u64>,
+    ) -> Result<ConsumerResetResponse, ConsumerResetError> {
+        let subject = format!("CONSUMER.RESET.{}.{}", self.name, name);
+        let payload = ConsumerResetRequest {
+            seq: seq.unwrap_or(0),
+        };
+
+        match self.context.request(subject, &payload).await? {
+            Response::Ok::<ConsumerResetResponse>(resp) => Ok(resp),
             Response::Err { error } => Err(error.into()),
         }
     }
@@ -1264,12 +1233,13 @@ pub struct Config {
     /// A name for the Stream. Must not have spaces, tabs or period `.` characters
     pub name: String,
     /// How large the Stream may become in total bytes before the configured discard policy kicks in
+    #[serde(default)]
     pub max_bytes: i64,
     /// How large the Stream may become in total messages before the configured discard policy kicks in
-    #[serde(rename = "max_msgs")]
+    #[serde(default, rename = "max_msgs")]
     pub max_messages: i64,
     /// Maximum amount of messages to keep per subject
-    #[serde(rename = "max_msgs_per_subject")]
+    #[serde(default, rename = "max_msgs_per_subject")]
     pub max_messages_per_subject: i64,
     /// When a Stream has reached its configured `max_bytes` or `max_msgs`, this policy kicks in.
     /// `DiscardPolicy::New` refuses new messages or `DiscardPolicy::Old` (default) deletes old messages to make space
@@ -1284,9 +1254,10 @@ pub struct Config {
     /// How message retention is considered, `Limits` (default), `Interest` or `WorkQueue`
     pub retention: RetentionPolicy,
     /// How many Consumers can be defined for a given Stream, -1 for unlimited
+    #[serde(default)]
     pub max_consumers: i32,
     /// Maximum age of any message in the stream, expressed in nanoseconds
-    #[serde(with = "serde_nanos")]
+    #[serde(default, with = "serde_nanos")]
     pub max_age: Duration,
     /// The largest message that will be accepted by the Stream
     #[serde(default, skip_serializing_if = "is_default", rename = "max_msg_size")]
@@ -1364,7 +1335,11 @@ pub struct Config {
     pub compression: Option<Compression>,
     #[cfg(feature = "server_2_10")]
     /// Set limits on consumers that are created on this stream.
-    #[serde(default, deserialize_with = "default_consumer_limits_as_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "default_consumer_limits_as_none"
+    )]
     pub consumer_limits: Option<ConsumerLimits>,
 
     #[cfg(feature = "server_2_10")]
@@ -1375,6 +1350,11 @@ pub struct Config {
     /// Placement configuration for clusters and tags.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<Placement>,
+
+    /// Persistence mode for the stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_mode: Option<PersistenceMode>,
+
     /// For suspending the consumer until the deadline.
     #[cfg(feature = "server_2_11")]
     #[serde(
@@ -1382,7 +1362,7 @@ pub struct Config {
         with = "rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
-    pub pause_until: Option<OffsetDateTime>,
+    pub pause_until: Option<DateTime>,
 
     /// Allows setting a TTL for a message in the stream.
     #[cfg(feature = "server_2_11")]
@@ -1394,6 +1374,35 @@ pub struct Config {
     #[cfg(feature = "server_2_11")]
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_nanos")]
     pub subject_delete_marker_ttl: Option<Duration>,
+
+    /// Allows atomic publish operations.
+    #[cfg(feature = "server_2_12")]
+    #[serde(default, skip_serializing_if = "is_default", rename = "allow_atomic")]
+    pub allow_atomic_publish: bool,
+
+    /// Enables the scheduling of messages
+    #[cfg(feature = "server_2_12")]
+    #[serde(
+        default,
+        skip_serializing_if = "is_default",
+        rename = "allow_msg_schedules"
+    )]
+    pub allow_message_schedules: bool,
+
+    /// Enables counters for the stream
+    #[cfg(feature = "server_2_12")]
+    #[serde(
+        default,
+        skip_serializing_if = "is_default",
+        rename = "allow_msg_counter"
+    )]
+    pub allow_message_counter: bool,
+
+    /// Allows fast-ingest batch publishing on the stream (ADR-50).
+    #[cfg(feature = "server_2_14")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server_2_14")))]
+    #[serde(default, skip_serializing_if = "is_default", rename = "allow_batched")]
+    pub allow_batch_publish: bool,
 }
 
 impl From<&Config> for Config {
@@ -1526,6 +1535,19 @@ pub enum StorageType {
     Memory = 1,
 }
 
+/// Determines the persistence mode for stream data.
+#[derive(Default, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PersistenceMode {
+    /// Writes are immediately flushed, acknowledgement sent after message is stored.
+    #[default]
+    #[serde(rename = "default")]
+    Default = 0,
+    /// Writes are flushed asynchronously, acknowledgement may be sent before message is stored.
+    #[serde(rename = "async")]
+    Async = 1,
+}
+
 async fn stream_info_with_details(
     context: Context,
     stream: String,
@@ -1649,7 +1671,7 @@ pub struct Info {
     pub config: Config,
     /// The time that this stream was created.
     #[serde(with = "rfc3339")]
-    pub created: time::OffsetDateTime,
+    pub created: DateTime,
     /// Various metrics associated with this stream.
     pub state: State,
     /// Information about leader and replicas.
@@ -1681,7 +1703,7 @@ pub struct DeleteStatus {
 pub struct PauseResponse {
     pub paused: bool,
     #[serde(with = "rfc3339")]
-    pub pause_until: OffsetDateTime,
+    pub pause_until: DateTime,
     #[serde(default, with = "serde_nanos")]
     pub pause_remaining: Option<Duration>,
 }
@@ -1690,7 +1712,29 @@ pub struct PauseResponse {
 #[derive(Serialize, Debug)]
 struct PauseResumeConsumerRequest {
     #[serde(with = "rfc3339::option", skip_serializing_if = "Option::is_none")]
-    pause_until: Option<OffsetDateTime>,
+    pause_until: Option<DateTime>,
+}
+
+#[cfg(feature = "server_2_14")]
+#[derive(Serialize, Debug)]
+pub(crate) struct ConsumerResetRequest {
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub(crate) seq: u64,
+}
+
+/// Response from a [`Stream::reset_consumer`] / [`crate::jetstream::consumer::Consumer::reset`] call.
+#[cfg(feature = "server_2_14")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server_2_14")))]
+#[derive(Debug, Deserialize, Clone)]
+pub struct ConsumerResetResponse {
+    /// Refreshed [Info][crate::jetstream::consumer::Info] for the consumer
+    /// after the reset has been applied.
+    #[serde(flatten)]
+    pub info: super::consumer::Info,
+    /// Stream sequence the consumer's ack floor is now sitting at after the
+    /// reset. For an empty / `None` request this echoes the previously held
+    /// ack-floor seq.
+    pub reset_seq: u64,
 }
 
 /// information about the given stream.
@@ -1705,13 +1749,13 @@ pub struct State {
     pub first_sequence: u64,
     /// The time associated with the oldest message still present in this stream
     #[serde(with = "rfc3339", rename = "first_ts")]
-    pub first_timestamp: time::OffsetDateTime,
+    pub first_timestamp: DateTime,
     /// The last sequence number assigned to a message in this stream
     #[serde(rename = "last_seq")]
     pub last_sequence: u64,
     /// The time that the last message was received by this stream
     #[serde(with = "rfc3339", rename = "last_ts")]
-    pub last_timestamp: time::OffsetDateTime,
+    pub last_timestamp: DateTime,
     /// The number of consumers configured to consume this stream
     pub consumer_count: usize,
     /// The number of subjects in the stream
@@ -1749,7 +1793,7 @@ pub struct RawMessage {
 
     /// The time the message was published.
     #[serde(rename = "time", with = "rfc3339")]
-    pub time: time::OffsetDateTime,
+    pub time: DateTime,
 }
 
 impl TryFrom<RawMessage> for StreamMessage {
@@ -1839,10 +1883,7 @@ fn parse_headers(
                 s.push_str(v.trim());
             }
 
-            headers.insert(
-                HeaderName::from_str(k)?,
-                HeaderValue::from_str(&s).map_err(|err| Box::new(io::Error::other(err)))?,
-            );
+            headers.insert(HeaderName::from_str(k)?, s);
         } else {
             return Err(Box::new(std::io::Error::other("malformed header line")));
         }
@@ -1877,7 +1918,7 @@ pub struct ClusterInfo {
     pub leader: Option<String>,
     /// The time since this server has been the leader.
     #[serde(default, with = "rfc3339::option")]
-    pub leader_since: Option<OffsetDateTime>,
+    pub leader_since: Option<DateTime>,
     /// Indicates if this account is a system account.
     #[cfg(feature = "server_2_12")]
     #[serde(default)]
@@ -1981,7 +2022,7 @@ pub struct Source {
         with = "rfc3339::option"
     )]
     /// Optional source start time.
-    pub start_time: Option<OffsetDateTime>,
+    pub start_time: Option<DateTime>,
     /// Optional additional filter subject.
     #[serde(default, skip_serializing_if = "is_default")]
     pub filter_subject: Option<String>,
@@ -1995,6 +2036,43 @@ pub struct Source {
     #[cfg(feature = "server_2_10")]
     #[serde(default, skip_serializing_if = "is_default")]
     pub subject_transforms: Vec<SubjectTransform>,
+
+    /// Pre-created durable consumer to use for sourcing instead of the
+    /// auto-managed ephemeral one. Required for full control over the
+    /// consumer's lifecycle (security, advanced delivery/replay options)
+    /// when sourcing/mirroring from WorkQueue/Interest streams. Both
+    /// `name` and `deliver_subject` must be non-empty and valid; the
+    /// server rejects the config otherwise. See ADR-60.
+    #[cfg(feature = "server_2_14")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "server_2_14")))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<StreamConsumerSource>,
+}
+
+/// Configures a pre-created durable consumer used for stream
+/// sourcing/mirroring. See ADR-60.
+#[cfg(feature = "server_2_14")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server_2_14")))]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Default)]
+pub struct StreamConsumerSource {
+    /// Name of the durable consumer to use for sourcing.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub name: String,
+    /// Deliver subject of the (push) consumer used for sourcing.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub deliver_subject: String,
+}
+
+#[cfg(feature = "server_2_14")]
+impl StreamConsumerSource {
+    /// Build a [`StreamConsumerSource`] with both required fields populated.
+    /// The server rejects either field empty (`NewJSSourceDurableConsumerCfgInvalidError`).
+    pub fn new(name: impl Into<String>, deliver_subject: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            deliver_subject: deliver_subject.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Default)]
@@ -2359,6 +2437,71 @@ impl Display for ConsumerErrorKind {
 
 pub type ConsumerError = Error<ConsumerErrorKind>;
 
+#[cfg(feature = "server_2_14")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server_2_14")))]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConsumerResetErrorKind {
+    TimedOut,
+    Request,
+    /// Stream or consumer does not exist.
+    ///
+    /// Surfaced when the server replies with `CONSUMER_NOT_FOUND` /
+    /// `STREAM_NOT_FOUND`, or via core NATS `NoResponders` if the JS API
+    /// has no handler for the subject.
+    NotFound,
+    /// Reset request violates the consumer's `DeliverPolicy` constraints
+    /// (e.g. seq below `OptStartSeq`, or non-zero seq with a `DeliverPolicy`
+    /// other than `All` / `ByStartSequence` / `ByStartTime`).
+    InvalidReset,
+    JetStream(super::errors::Error),
+}
+
+#[cfg(feature = "server_2_14")]
+#[cfg_attr(docsrs, doc(cfg(feature = "server_2_14")))]
+impl Display for ConsumerResetErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut => write!(f, "timed out"),
+            Self::Request => write!(f, "request failed"),
+            Self::NotFound => write!(f, "stream or consumer not found"),
+            Self::InvalidReset => write!(f, "invalid reset"),
+            Self::JetStream(err) => write!(f, "JetStream error: {err}"),
+        }
+    }
+}
+
+#[cfg(feature = "server_2_14")]
+pub type ConsumerResetError = Error<ConsumerResetErrorKind>;
+
+#[cfg(feature = "server_2_14")]
+impl From<super::errors::Error> for ConsumerResetError {
+    fn from(err: super::errors::Error) -> Self {
+        match err.error_code() {
+            super::errors::ErrorCode::CONSUMER_INVALID_RESET => {
+                ConsumerResetError::new(ConsumerResetErrorKind::InvalidReset)
+            }
+            super::errors::ErrorCode::CONSUMER_NOT_FOUND
+            | super::errors::ErrorCode::STREAM_NOT_FOUND => {
+                ConsumerResetError::new(ConsumerResetErrorKind::NotFound)
+            }
+            _ => ConsumerResetError::new(ConsumerResetErrorKind::JetStream(err)),
+        }
+    }
+}
+
+#[cfg(feature = "server_2_14")]
+impl From<super::context::RequestError> for ConsumerResetError {
+    fn from(err: super::context::RequestError) -> Self {
+        match err.kind() {
+            RequestErrorKind::TimedOut => ConsumerResetError::new(ConsumerResetErrorKind::TimedOut),
+            RequestErrorKind::NoResponders => {
+                ConsumerResetError::new(ConsumerResetErrorKind::NotFound)
+            }
+            _ => ConsumerResetError::with_source(ConsumerResetErrorKind::Request, err),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConsumerCreateStrictErrorKind {
     //TODO: get last should have timeout, which should be mapped here.
@@ -2525,14 +2668,271 @@ impl From<super::context::RequestError> for ConsumerCreateStrictError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct StreamGetMessage {
-    #[serde(rename = "seq", skip_serializing_if = "is_default")]
+#[derive(Debug, Serialize, Default)]
+pub struct DirectGetRequest {
+    #[serde(rename = "seq", skip_serializing_if = "Option::is_none")]
     sequence: Option<u64>,
-    #[serde(rename = "next_by_subj", skip_serializing_if = "is_default")]
-    next_by_subject: Option<String>,
-    #[serde(rename = "last_by_subj", skip_serializing_if = "is_default")]
+    #[serde(rename = "last_by_subj", skip_serializing)]
     last_by_subject: Option<String>,
+    #[serde(rename = "next_by_subj", skip_serializing_if = "Option::is_none")]
+    next_by_subject: Option<String>,
+}
+
+/// Marker type indicating that headers should be included in the response.
+pub struct WithHeaders;
+
+/// Marker type indicating that headers should be excluded from the response.
+pub struct WithoutHeaders;
+
+/// Trait for converting a Message response into the appropriate return type.
+trait DirectGetResponse: Sized {
+    fn from_message(message: crate::Message) -> Result<Self, DirectGetError>;
+}
+
+impl DirectGetResponse for StreamMessage {
+    fn from_message(message: crate::Message) -> Result<Self, DirectGetError> {
+        StreamMessage::try_from(message).map_err(Into::into)
+    }
+}
+
+impl DirectGetResponse for StreamValue {
+    fn from_message(message: crate::Message) -> Result<Self, DirectGetError> {
+        Ok(StreamValue {
+            data: message.payload,
+        })
+    }
+}
+
+pub struct DirectGetBuilder<T = WithHeaders> {
+    context: Context,
+    stream_name: String,
+    request: DirectGetRequest,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl DirectGetBuilder<WithHeaders> {
+    fn new(context: Context, stream_name: String) -> DirectGetBuilder<WithHeaders> {
+        DirectGetBuilder {
+            context,
+            stream_name,
+            request: DirectGetRequest::default(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> DirectGetBuilder<T> {
+    /// Internal method to send the direct get request and convert to the appropriate type.
+    async fn send_internal<R: DirectGetResponse>(&self) -> Result<R, DirectGetError> {
+        // When last_by_subject is used, the subject is embedded in the URL and we should send an empty payload
+        // to match the NATS protocol expectation (similar to nats.go implementation)
+        let payload = if self.request.last_by_subject.is_some() {
+            Bytes::new()
+        } else {
+            serde_json::to_vec(&self.request).map(Bytes::from)?
+        };
+
+        let request_subject = if let Some(ref subject) = self.request.last_by_subject {
+            format!(
+                "{}.DIRECT.GET.{}.{}",
+                self.context.prefix, self.stream_name, subject
+            )
+        } else {
+            format!("{}.DIRECT.GET.{}", self.context.prefix, self.stream_name)
+        };
+
+        let api_request = self
+            .context
+            .apply_timeout(crate::client::Request::new().payload(payload));
+        let response = self
+            .context
+            .client
+            .send_request(request_subject, api_request)
+            .await?;
+
+        // Check for error status
+        if let Some(status) = response.status {
+            if let Some(ref description) = response.description {
+                match status {
+                    StatusCode::NOT_FOUND => {
+                        return Err(DirectGetError::new(DirectGetErrorKind::NotFound))
+                    }
+                    // 408 is used in Direct Message for bad/empty payload.
+                    StatusCode::TIMEOUT => {
+                        return Err(DirectGetError::new(DirectGetErrorKind::InvalidSubject))
+                    }
+                    _ => {
+                        return Err(DirectGetError::new(DirectGetErrorKind::ErrorResponse(
+                            status,
+                            description.to_string(),
+                        )));
+                    }
+                }
+            }
+        }
+
+        R::from_message(response)
+    }
+
+    /// Sets the sequence for the direct get request.
+    pub fn sequence(mut self, seq: u64) -> Self {
+        self.request.sequence = Some(seq);
+        self
+    }
+
+    /// Sets the last_by_subject for the direct get request.
+    pub fn last_by_subject<S: Into<String>>(mut self, subject: S) -> Self {
+        self.request.last_by_subject = Some(subject.into());
+        self
+    }
+
+    /// Sets the next_by_subject for the direct get request.
+    pub fn next_by_subject<S: Into<String>>(mut self, subject: S) -> Self {
+        self.request.next_by_subject = Some(subject.into());
+        self
+    }
+}
+
+impl DirectGetBuilder<WithHeaders> {
+    /// Sends the get request and returns a StreamMessage with headers.
+    pub async fn send(self) -> Result<StreamMessage, DirectGetError> {
+        self.send_internal::<StreamMessage>().await
+    }
+}
+
+impl DirectGetBuilder<WithoutHeaders> {
+    /// Sends the get request and returns only the payload bytes without headers.
+    pub async fn send(self) -> Result<StreamValue, DirectGetError> {
+        self.send_internal::<StreamValue>().await
+    }
+}
+
+pub struct StreamValue {
+    pub data: Bytes,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct RawMessageRequest {
+    #[serde(rename = "seq", skip_serializing_if = "Option::is_none")]
+    sequence: Option<u64>,
+    #[serde(rename = "last_by_subj", skip_serializing_if = "Option::is_none")]
+    last_by_subject: Option<String>,
+    #[serde(rename = "next_by_subj", skip_serializing_if = "Option::is_none")]
+    next_by_subject: Option<String>,
+}
+
+/// Trait for converting a RawMessage response into the appropriate return type.
+trait RawMessageResponse: Sized {
+    fn from_raw_message(message: RawMessage) -> Result<Self, RawMessageError>;
+}
+
+impl RawMessageResponse for StreamMessage {
+    fn from_raw_message(message: RawMessage) -> Result<Self, RawMessageError> {
+        StreamMessage::try_from(message)
+            .map_err(|err| RawMessageError::with_source(RawMessageErrorKind::Other, err))
+    }
+}
+
+impl RawMessageResponse for StreamValue {
+    fn from_raw_message(message: RawMessage) -> Result<Self, RawMessageError> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let decoded_payload = STANDARD.decode(message.payload).map_err(|err| {
+            RawMessageError::with_source(
+                RawMessageErrorKind::Other,
+                Box::new(std::io::Error::other(err)),
+            )
+        })?;
+
+        Ok(StreamValue {
+            data: decoded_payload.into(),
+        })
+    }
+}
+
+pub struct RawMessageBuilder<T = WithHeaders> {
+    context: Context,
+    stream_name: String,
+    request: RawMessageRequest,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl RawMessageBuilder<WithHeaders> {
+    fn new(context: Context, stream_name: String) -> Self {
+        RawMessageBuilder {
+            context,
+            stream_name,
+            request: RawMessageRequest::default(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> RawMessageBuilder<T> {
+    /// Internal method to send the raw message request and convert to the appropriate type.
+    async fn send_internal<R: RawMessageResponse>(&self) -> Result<R, RawMessageError> {
+        // Validate subjects
+        for subject in [&self.request.last_by_subject, &self.request.next_by_subject]
+            .into_iter()
+            .flatten()
+        {
+            if !is_valid_subject(subject) {
+                return Err(RawMessageError::new(RawMessageErrorKind::InvalidSubject));
+            }
+        }
+
+        let subject = format!("STREAM.MSG.GET.{}", self.stream_name);
+
+        let response: Response<GetRawMessage> = self
+            .context
+            .request(subject, &self.request)
+            .map_err(|err| RawMessageError::with_source(RawMessageErrorKind::Other, err))
+            .await?;
+
+        match response {
+            Response::Err { error } => {
+                if error.error_code() == ErrorCode::NO_MESSAGE_FOUND {
+                    Err(RawMessageError::new(RawMessageErrorKind::NoMessageFound))
+                } else {
+                    Err(RawMessageError::new(RawMessageErrorKind::JetStream(error)))
+                }
+            }
+            Response::Ok(value) => R::from_raw_message(value.message),
+        }
+    }
+
+    /// Sets the sequence for the raw message request.
+    pub fn sequence(mut self, seq: u64) -> Self {
+        self.request.sequence = Some(seq);
+        self
+    }
+
+    /// Sets the last_by_subject for the raw message request.
+    pub fn last_by_subject<S: Into<String>>(mut self, subject: S) -> Self {
+        self.request.last_by_subject = Some(subject.into());
+        self
+    }
+
+    /// Sets the next_by_subject for the raw message request.
+    pub fn next_by_subject<S: Into<String>>(mut self, subject: S) -> Self {
+        self.request.next_by_subject = Some(subject.into());
+        self
+    }
+}
+
+impl RawMessageBuilder<WithHeaders> {
+    /// Sends the raw message request and returns a StreamMessage with headers.
+    pub async fn send(self) -> Result<StreamMessage, RawMessageError> {
+        self.send_internal::<StreamMessage>().await
+    }
+}
+
+impl RawMessageBuilder<WithoutHeaders> {
+    /// Sends the raw message request and returns only the payload as StreamValue.
+    pub async fn send(self) -> Result<StreamValue, RawMessageError> {
+        self.send_internal::<StreamValue>().await
+    }
 }
 
 #[cfg(test)]
@@ -2550,5 +2950,27 @@ mod tests {
             serde_json::from_str(&ser).unwrap()
         };
         assert_eq!(config, roundtrip);
+    }
+
+    #[test]
+    fn consumer_limits_omitted_when_none() {
+        let config = serde_json::to_value(Config::default()).unwrap();
+
+        assert_eq!(config.get("consumer_limits"), None);
+    }
+
+    #[test]
+    fn raw_message_header_value_with_carriage_return() {
+        let raw: RawMessage = serde_json::from_value(serde_json::json!({
+            "subject": "events",
+            "seq": 1,
+            "hdrs": STANDARD.encode("NATS/1.0\r\nHeader: a\rb\r\n\r\n"),
+            "time": "2026-11-02T00:00:00Z",
+        }))
+        .unwrap();
+
+        let message = StreamMessage::try_from(raw).unwrap();
+
+        assert_eq!(message.headers.get("Header").unwrap().as_str(), "a b");
     }
 }

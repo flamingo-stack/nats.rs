@@ -19,18 +19,49 @@ mod client {
     #[tokio::test]
     async fn basic_tls() {
         let server = nats_server::run_server("tests/configs/tls.conf");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-        // Should fail without certs.
-        assert!(async_nats::connect(&server.client_url()).await.is_err());
-
-        // Should fail with IP (cert doesn't have proper SAN entry)
-        assert!(
-            async_nats::connect(format!("tls://127.0.0.1:{}", server.client_port()))
+        // Should fail without a client certificate. The root is given, so that this fails on
+        // the client certificate with or without the platform's roots (`native-certs`). One
+        // address, verified as localhost: with every address failing, the error would be the
+        // last one's, which depends on the resolver's order.
+        let err =
+            async_nats::ConnectOptions::with_user_and_password("derek".into(), "porkchop".into())
+                .add_root_certificates(path.join("tests/configs/certs/rootCA.pem"))
+                .tls_server_name("localhost")
+                .connect(format!("tls://127.0.0.1:{}", server.client_port()))
                 .await
-                .is_err()
+                .unwrap_err();
+        // The server sends the CertificateRequired alert and closes the connection. If the
+        // client's CONNECT is still unread then, or arrives after the close, the connection is
+        // reset, and Windows can drop the alert the client has not read yet when the reset
+        // arrives. There the error can be the reset (os error 10054) instead.
+        let reset_on_windows = cfg!(windows)
+            && err.kind() == async_nats::ConnectErrorKind::Io
+            && std::error::Error::source(&err)
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .is_some_and(|source| source.kind() == std::io::ErrorKind::ConnectionReset);
+        assert!(
+            reset_on_windows || err.to_string().contains("CertificateRequired"),
+            "{err}"
         );
 
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // Should fail with IP (cert doesn't have proper SAN entry)
+        let err =
+            async_nats::ConnectOptions::with_user_and_password("derek".into(), "porkchop".into())
+                .add_root_certificates(path.join("tests/configs/certs/rootCA.pem"))
+                .add_client_certificate(
+                    path.join("tests/configs/certs/client-cert.pem"),
+                    path.join("tests/configs/certs/client-key.pem"),
+                )
+                .connect(format!("tls://127.0.0.1:{}", server.client_port()))
+                .await
+                .unwrap_err();
+        assert_eq!(err.kind(), async_nats::ConnectErrorKind::Tls, "{err}");
+        assert!(
+            err.to_string().contains("is not valid for \"127.0.0.1\""),
+            "{err}"
+        );
 
         async_nats::ConnectOptions::with_user_and_password("derek".into(), "porkchop".into())
             .add_root_certificates(path.join("tests/configs/certs/rootCA.pem"))
@@ -60,13 +91,30 @@ mod client {
     #[tokio::test]
     async fn unknown_server_ca() {
         let server = nats_server::run_server("tests/configs/tls.conf");
-        assert!(async_nats::connect(&server.client_url()).await.is_err());
 
-        async_nats::ConnectOptions::with_user_and_password("derek".into(), "porkchop".into())
-            .require_tls(true)
-            .connect(server.client_url())
-            .await
-            .unwrap_err();
+        // The platform's roots do not hold the test CA.
+        #[cfg(feature = "native-certs")]
+        {
+            assert!(async_nats::connect(&server.client_url()).await.is_err());
+
+            async_nats::ConnectOptions::with_user_and_password("derek".into(), "porkchop".into())
+                .require_tls(true)
+                .connect(server.client_url())
+                .await
+                .unwrap_err();
+        }
+
+        // Nor does a root that did not sign the server's certificate. One address, verified
+        // as localhost, as in basic_tls.
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let err =
+            async_nats::ConnectOptions::with_user_and_password("derek".into(), "porkchop".into())
+                .add_root_certificates(path.join("tests/configs/certs/ip-ca.pem"))
+                .tls_server_name("localhost")
+                .connect(format!("tls://127.0.0.1:{}", server.client_port()))
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("UnknownIssuer"), "{err}");
     }
 
     #[tokio::test]
@@ -113,6 +161,7 @@ mod client {
         assert!(subscribe.next().await.is_some());
     }
 
+    #[cfg(feature = "native-certs")]
     #[tokio::test]
     async fn tls_with_native_certs() {
         let client = async_nats::ConnectOptions::new()
@@ -197,5 +246,70 @@ mod client {
                 .unwrap();
 
         assert!(client.server_info().tls_required);
+    }
+
+    // nats-server before 2.12 lists a formed cluster's servers to a client that starts TLS
+    // after INFO only in the INFO read before TLS, which the client does not use.
+    #[cfg(feature = "server_2_12")]
+    #[tokio::test]
+    async fn discovered_ip_servers_keep_tls_name() {
+        // Servers advertise 127.0.0.1, while the certificate is only valid
+        // for localhost, so discovered servers have to be verified against
+        // the name the client was originally given.
+        let mut cluster = nats_server::run_cluster("tests/configs/tls_cluster.conf");
+        let seed_port = cluster.servers[0].client_port();
+
+        let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::channel(8);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let client = async_nats::ConnectOptions::new()
+            .add_root_certificates(path.join("tests/configs/certs/rootCA.pem"))
+            .require_tls(true)
+            .event_callback(move |event| {
+                let reconnect_tx = reconnect_tx.clone();
+                async move {
+                    if let async_nats::Event::Connected = event {
+                        reconnect_tx.send(()).await.ok();
+                    }
+                }
+            })
+            .connect(format!("tls://localhost:{seed_port}"))
+            .await
+            .unwrap();
+        reconnect_rx.recv().await.unwrap();
+
+        let pool = client.server_pool().await.unwrap();
+        let discovered: Vec<_> = pool.iter().filter(|s| s.is_discovered).collect();
+        assert!(!discovered.is_empty(), "no servers discovered: {pool:?}");
+        assert!(
+            discovered.iter().all(|s| s.addr.host() == "127.0.0.1"),
+            "expected only IP servers to be discovered: {pool:?}"
+        );
+
+        // Stop the seed server, leaving only servers reachable by IP.
+        drop(cluster.servers.remove(0));
+
+        tokio::time::timeout(Duration::from_secs(10), reconnect_rx.recv())
+            .await
+            .expect("did not reconnect to a discovered server")
+            .unwrap();
+        assert_ne!(client.server_info().port, seed_port);
+        assert!(client.server_info().tls_required);
+
+        let mut sub = client.subscribe("foo").await.unwrap();
+        client.publish("foo", "data".into()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), sub.next())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The name check is not skipped: an IP the certificate does not
+        // cover is still rejected when dialed directly.
+        let port = client.server_info().port;
+        async_nats::ConnectOptions::new()
+            .add_root_certificates(path.join("tests/configs/certs/rootCA.pem"))
+            .require_tls(true)
+            .connect(format!("tls://127.0.0.1:{port}"))
+            .await
+            .unwrap_err();
     }
 }

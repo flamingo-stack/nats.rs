@@ -1,4 +1,6 @@
-name: ci
+name: CI
+permissions:
+  contents: read
 
 on:
   push:
@@ -37,14 +39,13 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v3
-
       - name: Generate go.sum # go.sum is required by caching on the next step
         run: touch go.sum
       - name: Set up Go
         id:   setup-go
         uses: actions/setup-go@v4 # v4 uses caching out of the box
         with:
-          go-version: '1.22'
+          go-version: '1.25'
       - name: Install nats-server
         run:  go install github.com/nats-io/nats-server/v2@main
       - name: Install stable Rust on ${{ matrix.os }}
@@ -60,7 +61,6 @@ jobs:
         id:   build-packages
         run:  |
           cargo build --all-targets
-
       - name: Setup deno for service tests
         if: ${{ matrix.os }} != windows-latest
         uses: denoland/setup-deno@v1
@@ -71,14 +71,181 @@ jobs:
           RUST_BACKTRACE: 1
         run: |
           cargo test --features slow_tests,websockets -- --nocapture
-      - name: TLS tests (ring, aws-lc-rs, fips)
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+      # TLS and version-specific tests are now run in parallel in a separate job
+
+  nats_server_tests:
+    defaults:
+      run:
+        working-directory: ./nats-server
+    name: nats-server tests (ubuntu-latest / stable)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+      - name: Generate go.sum
+        run: touch go.sum
+      - name: Set up Go
+        id: setup-go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.25'
+      - name: Install nats-server
+        run: go install github.com/nats-io/nats-server/v2@main
+      - name: Install stable Rust
+        id: install-rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache the build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ steps.install-rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.toml') }}
+          cache-on-failure: true
+      - name: Run nats-server tests
+        env:
+          RUST_BACKTRACE: 1
         run: |
-          # we do not want to create more matrices just for tls test.
-          # It's easier to test it manually here.
-          cargo test tls --features=ring --no-default-features -- --nocapture
-          cargo test tls --features=aws-lc-rs --no-default-features -- --nocapture
-          cargo test tls --features=fips --no-default-features -- --nocapture
+          cargo test --lib -- --test-threads=1 --nocapture
+
+  tls_tests:
+    defaults:
+      run:
+        working-directory: ./async-nats
+    name: TLS tests (${{ matrix.tls_feature }} / ubuntu-latest)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tls_feature: [ring, aws-lc-rs, fips]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+      - name: Generate go.sum # go.sum is required by caching on the next step
+        run: touch go.sum
+      - name: Set up Go
+        id:   setup-go
+        uses: actions/setup-go@v4 # v4 uses caching out of the box
+        with:
+          go-version: '1.25'
+      - name: Install nats-server
+        run:  go install github.com/nats-io/nats-server/v2@main
+      - name: Install stable Rust
+        id: install-rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache the build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ steps.install-rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.toml') }}
+          cache-on-failure: true
+      - name: Check the lockfile without websockets (${{ matrix.tls_feature }})
+        shell: bash
+        run: |
+          consumer_dir=$(mktemp -d)
+          trap 'rm -rf "$consumer_dir"' EXIT
+          mkdir "$consumer_dir/src"
+          touch "$consumer_dir/src/lib.rs"
+          # Every feature except `websockets` and the other providers, so that a weak
+          # `tokio-websockets?/...` reference added to any of them shows up here.
+          cat > "$consumer_dir/Cargo.toml" <<EOF
+          [package]
+          name = "async-nats-lockfile-check"
+          version = "0.0.0"
+          edition = "2021"
+
+          [dependencies]
+          async-nats = { path = "$GITHUB_WORKSPACE/async-nats", default-features = false, features = ["jetstream", "kv", "object-store", "service", "chrono", "crypto", "nkeys", "nuid", "experimental", "server_2_10", "server_2_11", "server_2_12", "server_2_14", "${{ matrix.tls_feature }}"] }
+          EOF
+          cargo generate-lockfile --manifest-path "$consumer_dir/Cargo.toml"
+          unwanted='^name = "(tokio-websockets|webpki-roots|sha1_smol)"$'
+          # `fips` forwards a weak feature to tokio-websockets, which Cargo locks but does not build
+          # (rust-lang/cargo#10801); the CA bundle must still stay out.
+          if [ "${{ matrix.tls_feature }}" = fips ]; then
+            unwanted='^name = "webpki-roots"$'
+          fi
+          if grep -E "$unwanted" "$consumer_dir/Cargo.lock"; then
+            echo "websocket dependencies must not be locked when websockets are disabled" >&2
+            exit 1
+          fi
+      - name: Check the lockfile without native-certs (${{ matrix.tls_feature }})
+        shell: bash
+        run: |
+          consumer_dir=$(mktemp -d)
+          trap 'rm -rf "$consumer_dir"' EXIT
+          mkdir "$consumer_dir/src"
+          touch "$consumer_dir/src/lib.rs"
+          # Every feature except `native-certs` and the other providers, `websockets` included,
+          # so that a dependency or feature pulling in the platform's root store from any of
+          # them shows up here. Without it, nothing that links Security.framework or
+          # CoreFoundation on macOS is locked, and a cross-compile to macOS needs no macOS SDK
+          # (#1695).
+          cat > "$consumer_dir/Cargo.toml" <<EOF
+          [package]
+          name = "async-nats-lockfile-check"
+          version = "0.0.0"
+          edition = "2021"
+
+          [dependencies]
+          async-nats = { path = "$GITHUB_WORKSPACE/async-nats", default-features = false, features = ["jetstream", "kv", "object-store", "service", "chrono", "crypto", "nkeys", "nuid", "websockets", "experimental", "server_2_10", "server_2_11", "server_2_12", "server_2_14", "${{ matrix.tls_feature }}"] }
+          EOF
+          cargo generate-lockfile --manifest-path "$consumer_dir/Cargo.toml"
+          if grep -E '^name = "(rustls-native-certs|security-framework(-sys)?|core-foundation(-sys)?)"$' "$consumer_dir/Cargo.lock"; then
+            echo "platform root store dependencies must not be locked when native-certs is disabled" >&2
+            exit 1
+          fi
+      - name: Run the TLS tests with ${{ matrix.tls_feature }}
+        env:
+          RUST_BACKTRACE: 1
+        # The binaries that exercise the TLS backend, named, so that a test is run by what
+        # it covers and not by whether "tls" occurs in its name.
+        run: |
+          cargo test --test tls_options --test tls_tests --test websocket_test --test discovered_servers --test info_handling --test root_certificates --no-default-features --features jetstream,kv,object-store,service,nkeys,nuid,crypto,websockets,native-certs,${{ matrix.tls_feature }},server_2_12 -- --nocapture
+      - name: Run the TLS tests with ${{ matrix.tls_feature }} without native-certs
+        env:
+          RUST_BACKTRACE: 1
+        # Without the platform's roots: the tests that need them are left out, and
+        # root_certificates checks the error for TLS without roots.
+        run: |
+          cargo test --lib --test tls_options --test tls_tests --test websocket_test --test discovered_servers --test info_handling --test root_certificates --no-default-features --features jetstream,kv,object-store,service,nkeys,nuid,crypto,websockets,${{ matrix.tls_feature }},server_2_12 -- --nocapture
+      - name: Run the unit and TLS option tests without websockets
+        if: matrix.tls_feature == 'ring'
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          cargo test --lib --test tls_options --test root_certificates --no-default-features --features jetstream,kv,object-store,service,nkeys,nuid,crypto,native-certs,ring -- --nocapture
+
+  server_2_11_tests:
+    defaults:
+      run:
+        working-directory: ./async-nats
+    name: Test against nats-server v2.11.9 (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+      - name: Generate go.sum
+        run: touch go.sum
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+      - name: Install nats-server v2.11.9
+        run: go install github.com/nats-io/nats-server/v2@v2.11.9
+      - name: Install stable Rust
+        id: install-rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache the build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ steps.install-rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.toml') }}
+          cache-on-failure: true
+      - name: Setup deno for service tests
+        if: ${{ matrix.os }} != windows-latest
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: v1.x
+      - name: Run tests against v2.11.9
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          cargo test --no-default-features --features jetstream,kv,object-store,service,nkeys,nuid,crypto,websockets,native-certs,ring,server_2_10,server_2_11
 
   check_format:
     name: check format (ubuntu-latest / nightly)
@@ -117,6 +284,48 @@ jobs:
 
       - name: Run linter
         run: cargo clippy --benches --tests --examples --all-features  -- --deny clippy::all
+      # `--all-features` selects the chrono backend; also lint the default (time) backend,
+      # whose mutually-exclusive cfg arm is otherwise never clippy-checked.
+      - name: Run linter (default/time backend)
+        run: cargo clippy --benches --tests --examples -- --deny clippy::all
+      # Both of the above enable `native-certs`; lint the arm without the platform's roots too.
+      - name: Run linter (without native-certs)
+        run: cargo clippy --benches --tests --examples --no-default-features --features jetstream,kv,object-store,service,nkeys,nuid,crypto,websockets,ring,server_2_10,server_2_11,server_2_12,server_2_14 -- --deny clippy::all
+      # Guard the chrono-without-jetstream/service combinations: the hand-written chrono
+      # rfc3339 adapter is unused there, which must not regress into a dead-code error
+      # under `-D warnings` (set at the workflow env level).
+      - name: Check chrono backend without jetstream/service
+        run: |
+          cargo check --no-default-features --features chrono,ring
+          cargo check --no-default-features --features chrono,service,ring
+      # `--all-features` enables `chrono`, which selects the chrono datetime backend, so
+      # the linter above lints the chrono code paths in src/datetime.rs. Run the chrono
+      # datetime unit tests explicitly, since the integration suite runs on the default backend.
+      - name: Run datetime unit tests (chrono backend)
+        run: cargo test --lib "datetime::" --features chrono
+
+  check_features:
+    defaults:
+      run:
+        working-directory: ./async-nats
+    name: check feature flags (ubuntu-latest / stable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+      - name: Install stable Rust on ubuntu-latest
+        id:   install-rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Restore cached build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ steps.install-rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.toml') }}
+          save-if: false # checks only, no full build to cache.
+      - name: Install cargo hack
+        run: cargo install cargo-hack
+      - name: Check feature combinations
+        run: bash .cargo-hack-check.sh
 
   check_docs:
     defaults:
@@ -130,7 +339,7 @@ jobs:
 
       - name: Install stable Rust on ubuntu-latest
         id:   install-rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
       - name: Restore cached build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -139,29 +348,6 @@ jobs:
 
       - name: Check lint
         run: cargo doc --no-deps --all-features
-
-  check_features:
-    defaults:
-      run:
-        working-directory: ./async-nats
-    name: check feature flags (ubuntu-latest / stable)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v3
-      - name: Install stable Rust on ubuntu-latest
-        id:   install-rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Restore cached build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ${{ runner.os }}-${{ steps.install-rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.toml') }}
-          save-if: false # we only build docs, so we don't have the full build to be cached.
-      - name: Install cargo hack
-        run: cargo install cargo-hack
-      - name: Check lint
-        run: cargo hack check --feature-powerset --at-least-one-of aws-lc-rs,ring --no-dev-deps -p async-nats
-
 
   check_licenses:
     name: check licenses (ubuntu-latest / stable)
@@ -187,7 +373,7 @@ jobs:
 
       - name: Install msrv Rust on ubuntu-latest
         id:   install-rust
-        uses: dtolnay/rust-toolchain@1.85.0
+        uses: dtolnay/rust-toolchain@1.89.0
       - name: Cache the build artifacts
         uses: Swatinem/rust-cache@v2
         with:

@@ -2,7 +2,7 @@ name: Sync from upstream nats.rs
 
 on:
   schedule:
-    - cron: "0 4 * * 1"
+    - cron: "23 4 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -39,8 +39,8 @@ jobs:
 
           git checkout -B "$BRANCH" origin/main
           if ! git merge --no-ff --no-edit upstream/main; then
-            echo "::notice::merge has conflicts — skipping, will retry next run"
-            exit 0
+            echo "::error::merge with upstream/main conflicts; merge it by hand"
+            exit 1
           fi
           git push -f origin "$BRANCH"
 

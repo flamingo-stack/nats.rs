@@ -14,6 +14,7 @@
 use crate::connector::ConnectorOptions;
 use crate::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::tls;
+use rustls_pki_types::pem::PemObject;
 use std::io::{self, BufReader, ErrorKind};
 use std::path::PathBuf;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -25,8 +26,15 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 pub(crate) async fn load_certs(path: PathBuf) -> io::Result<Vec<CertificateDer<'static>>> {
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(path)?;
-        let mut reader = BufReader::new(file);
-        rustls_pemfile::certs(&mut reader).collect::<io::Result<Vec<_>>>()
+        let reader = BufReader::new(file);
+        CertificateDer::pem_reader_iter(reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("could not load certificates: {}", e),
+                )
+            })
     })
     .await?
 }
@@ -37,26 +45,70 @@ pub(crate) async fn load_key(path: PathBuf) -> io::Result<PrivateKeyDer<'static>
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(path)?;
         let mut reader = BufReader::new(file);
-        rustls_pemfile::private_key(&mut reader)?
-            .ok_or_else(|| io::Error::other("could not find client key in the path"))
+        PrivateKeyDer::from_pem_reader(&mut reader).map_err(|e| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("could not load private key: {}", e),
+            )
+        })
     })
     .await?
 }
 
-pub(crate) async fn config_tls(options: &ConnectorOptions) -> io::Result<ClientConfig> {
-    let mut root_store = RootCertStore::empty();
-    // load native system certs only if user did not specify them.
-    if options.tls_client_config.is_some() || options.certificates.is_empty() {
-        let certs_iter = rustls_native_certs::load_native_certs()
-            .map_err(|err| io::Error::other(format!("could not load platform certs: {err}")))?;
-        root_store.add_parsable_certificates(certs_iter);
-    }
+/// Whether TLS falls back on the platform's root certificates: the user gave neither root
+/// certificates nor a rustls client config.
+pub(crate) fn needs_platform_roots(options: &ConnectorOptions) -> bool {
+    options.tls_client_config.is_none() && options.certificates.is_empty()
+}
 
+/// How to get roots in a build without the `native-certs` feature, for the errors that say
+/// there are none.
+#[cfg(not(feature = "native-certs"))]
+pub(crate) const NO_ROOTS_WAY_OUT: &str = "enable the `native-certs` feature of async-nats for \
+    the platform's roots, or pass roots with add_root_certificates() or tls_client_config()";
+
+/// Adds the platform's root certificates to `root_store`.
+#[cfg(feature = "native-certs")]
+fn add_native_roots(root_store: &mut RootCertStore) -> io::Result<()> {
+    let certs_result = rustls_native_certs::load_native_certs();
+    if !certs_result.errors.is_empty() {
+        let errors = certs_result
+            .errors
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<String>>()
+            .join("\n");
+        return Err(io::Error::other(format!(
+            "could not load platform certs: {errors}"
+        )));
+    }
+    root_store.add_parsable_certificates(certs_result.certs);
+    Ok(())
+}
+
+/// Without the `native-certs` feature there are no platform roots to fall back on. The
+/// connector refuses TLS without roots before it gets here (see `refused_tls` and
+/// `tls_handshake` in connector.rs); this stays as the last line.
+#[cfg(not(feature = "native-certs"))]
+fn add_native_roots(_root_store: &mut RootCertStore) -> io::Result<()> {
+    Err(io::Error::new(
+        ErrorKind::NotFound,
+        format!("no root certificates to verify the server with; {NO_ROOTS_WAY_OUT}"),
+    ))
+}
+
+pub(crate) async fn config_tls(options: &ConnectorOptions) -> io::Result<ClientConfig> {
     // use provided ClientConfig or built it from options.
     let tls_config = {
         if let Some(config) = &options.tls_client_config {
+            // The user's config brings its own roots, so the platform's are not loaded.
             Ok(config.to_owned())
         } else {
+            let mut root_store = RootCertStore::empty();
+            // Fall back on the platform's roots only when the user gave none.
+            if needs_platform_roots(options) {
+                add_native_roots(&mut root_store)?;
+            }
             // Include user-provided certificates.
             for cafile in &options.certificates {
                 let trust_anchors = load_certs(cafile.to_owned())

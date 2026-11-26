@@ -14,14 +14,12 @@
 //! Manage operations on [Context], create/delete/update [Stream]
 
 use crate::error::Error;
-use crate::header::{IntoHeaderName, IntoHeaderValue};
 use crate::jetstream::account::Account;
+use crate::jetstream::message::PublishMessage;
 use crate::jetstream::publish::PublishAck;
 use crate::jetstream::response::Response;
 use crate::subject::ToSubject;
-use crate::{
-    header, is_valid_subject, Client, Command, HeaderMap, HeaderValue, Message, StatusCode,
-};
+use crate::{is_valid_subject, jetstream, Client, Command, Message, StatusCode};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use futures_util::{Future, StreamExt, TryFutureExt};
@@ -29,62 +27,406 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json};
 use std::borrow::Borrow;
+use std::fmt::Debug;
 use std::fmt::Display;
 use std::future::IntoFuture;
 use std::pin::Pin;
 use std::str::from_utf8;
+use std::sync::Arc;
 use std::task::Poll;
-use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, TryAcquireError};
+use tokio::time::Duration;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 use super::consumer::{self, Consumer, FromConsumer, IntoConsumerConfig};
 use super::errors::ErrorCode;
+use super::is_valid_name;
+#[cfg(feature = "kv")]
 use super::kv::{Store, MAX_HISTORY};
+#[cfg(feature = "object-store")]
 use super::object_store::{is_valid_bucket_name, ObjectStore};
-use super::stream::{
-    self, Config, ConsumerError, ConsumerErrorKind, DeleteStatus, DiscardPolicy, External, Info,
-    Stream,
-};
+#[cfg(any(feature = "kv", feature = "object-store"))]
+use super::stream::DiscardPolicy;
 #[cfg(feature = "server_2_10")]
 use super::stream::{Compression, ConsumerCreateStrictError, ConsumerUpdateError};
-use super::{is_valid_name, kv};
+use super::stream::{
+    Config, ConsumerError, ConsumerErrorKind, DeleteStatus, External, Info, Stream,
+};
 
-/// A context which can perform jetstream scoped requests.
+pub mod traits {
+    use std::{future::Future, time::Duration};
+
+    use bytes::Bytes;
+    use serde::{de::DeserializeOwned, Serialize};
+
+    use crate::{jetstream::message, subject::ToSubject, Request};
+
+    use super::RequestError;
+
+    pub trait Requester {
+        fn request<S, T, V>(
+            &self,
+            subject: S,
+            payload: &T,
+        ) -> impl Future<Output = Result<V, RequestError>>
+        where
+            S: ToSubject,
+            T: ?Sized + Serialize,
+            V: DeserializeOwned;
+    }
+
+    pub trait RequestSender {
+        fn send_request<S: ToSubject>(
+            &self,
+            subject: S,
+            request: Request,
+        ) -> impl Future<Output = Result<(), crate::PublishError>>;
+    }
+
+    pub trait Publisher {
+        fn publish<S>(
+            &self,
+            subject: S,
+            payload: Bytes,
+        ) -> impl Future<Output = Result<super::PublishAckFuture, super::PublishError>>
+        where
+            S: ToSubject;
+
+        fn publish_message(
+            &self,
+            message: message::OutboundMessage,
+        ) -> impl Future<Output = Result<super::PublishAckFuture, super::PublishError>>;
+    }
+
+    pub trait ClientProvider {
+        fn client(&self) -> crate::Client;
+    }
+
+    /// Provides the context timeout, see
+    /// [`ContextBuilder::timeout`](super::ContextBuilder::timeout).
+    pub trait TimeoutProvider {
+        /// Returns the context timeout, or 5 seconds when none was set.
+        fn timeout(&self) -> Duration;
+    }
+}
+
+/// The wait for publish acks and double acks when no context timeout was set.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The bound on background recovery requests when neither a context timeout nor a connection
+/// request timeout was set.
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A context which can perform jetstream scoped requests. API requests are bounded by the
+/// connection's request timeout unless a context timeout is set, see
+/// [`ContextBuilder::timeout`].
 #[derive(Debug, Clone)]
 pub struct Context {
     pub(crate) client: Client,
     pub(crate) prefix: String,
-    pub(crate) timeout: Duration,
+    /// The timeout set with `ContextBuilder::timeout` or `set_timeout`, if any.
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) max_ack_semaphore: Arc<tokio::sync::Semaphore>,
+    pub(crate) ack_sender:
+        tokio::sync::mpsc::Sender<(oneshot::Receiver<Message>, OwnedSemaphorePermit)>,
+    pub(crate) backpressure_on_inflight: bool,
+    pub(crate) semaphore_capacity: usize,
+}
+
+fn spawn_acker(
+    rx: ReceiverStream<(oneshot::Receiver<Message>, OwnedSemaphorePermit)>,
+    ack_timeout: Duration,
+    concurrency: Option<usize>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        rx.for_each_concurrent(concurrency, |(subscription, permit)| async move {
+            tokio::time::timeout(ack_timeout, subscription).await.ok();
+            drop(permit);
+        })
+        .await;
+        debug!("Acker task exited");
+    })
+}
+
+use std::marker::PhantomData;
+
+#[derive(Debug, Default)]
+pub struct Yes;
+#[derive(Debug, Default)]
+pub struct No;
+
+pub trait ToAssign: Debug {}
+
+impl ToAssign for Yes {}
+impl ToAssign for No {}
+
+/// A builder for [Context]. Beyond what can be set by standard constructor, it allows tweaking
+/// pending publish ack backpressure settings.
+/// # Examples
+/// ```no_run
+/// # use async_nats::jetstream::context::ContextBuilder;
+/// # use async_nats::Client;
+/// # use std::time::Duration;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), async_nats::Error> {
+/// let client = async_nats::connect("demo.nats.io").await?;
+/// let context = ContextBuilder::new()
+///     // Bounds API requests and publish acks; unset, API requests follow the connection's
+///     // request timeout and acks wait 5 seconds.
+///     .timeout(Duration::from_secs(30))
+///     .api_prefix("MY.JS.API")
+///     .max_ack_inflight(1000)
+///     .build(client);
+/// # Ok(())
+/// # }
+/// ```
+pub struct ContextBuilder<PREFIX: ToAssign> {
+    prefix: String,
+    timeout: Option<Duration>,
+    semaphore_capacity: usize,
+    ack_timeout: Duration,
+    backpressure_on_inflight: bool,
+    concurrency_limit: Option<usize>,
+    _phantom: PhantomData<PREFIX>,
+}
+
+impl Default for ContextBuilder<Yes> {
+    fn default() -> Self {
+        ContextBuilder {
+            prefix: "$JS.API".to_string(),
+            timeout: None,
+            semaphore_capacity: 5_000,
+            ack_timeout: Duration::from_secs(30),
+            backpressure_on_inflight: true,
+            concurrency_limit: None,
+            _phantom: PhantomData {},
+        }
+    }
+}
+
+impl ContextBuilder<Yes> {
+    /// Create a new [ContextBuilder] with default settings.
+    pub fn new() -> ContextBuilder<Yes> {
+        ContextBuilder::default()
+    }
+}
+
+impl ContextBuilder<Yes> {
+    /// Set the prefix for the JetStream API.
+    pub fn api_prefix<T: Into<String>>(self, prefix: T) -> ContextBuilder<No> {
+        ContextBuilder {
+            prefix: prefix.into(),
+            timeout: self.timeout,
+            semaphore_capacity: self.semaphore_capacity,
+            ack_timeout: self.ack_timeout,
+            backpressure_on_inflight: self.backpressure_on_inflight,
+            concurrency_limit: self.concurrency_limit,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Set the domain for the JetStream API. Domain is the middle part of standard API prefix:
+    /// $JS.{domain}.API.
+    pub fn domain<T: Into<String>>(self, domain: T) -> ContextBuilder<No> {
+        ContextBuilder {
+            prefix: format!("$JS.{}.API", domain.into()),
+            timeout: self.timeout,
+            semaphore_capacity: self.semaphore_capacity,
+            ack_timeout: self.ack_timeout,
+            backpressure_on_inflight: self.backpressure_on_inflight,
+            concurrency_limit: self.concurrency_limit,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<PREFIX> ContextBuilder<PREFIX>
+where
+    PREFIX: ToAssign,
+{
+    /// Sets the timeout for JetStream API requests, publish acks and double acks.
+    ///
+    /// When set, it bounds the reply wait of every API request, including ordered consumer
+    /// recreation, regardless of the connection's
+    /// [`ConnectOptions::request_timeout`](crate::ConnectOptions::request_timeout). When not
+    /// set, API requests are bounded by the connection's request timeout, 10 seconds by default
+    /// and unbounded when that was disabled with `request_timeout(None)`, and acks by
+    /// 5 seconds. Pull requests are bounded by their own `expires` instead. A
+    /// [`Request::timeout`](crate::Request::timeout) on a raw request sent with the
+    /// [`Requester`](crate::client::traits::Requester) implementation replaces it.
+    pub fn timeout(self, timeout: Duration) -> ContextBuilder<Yes>
+    where
+        Yes: ToAssign,
+    {
+        ContextBuilder {
+            prefix: self.prefix,
+            timeout: Some(timeout),
+            semaphore_capacity: self.semaphore_capacity,
+            ack_timeout: self.ack_timeout,
+            backpressure_on_inflight: self.backpressure_on_inflight,
+            concurrency_limit: self.concurrency_limit,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Sets the maximum time the background ack handler waits for the ack of a publish whose
+    /// [`PublishAckFuture`] was dropped without being awaited. Defaults to 30 seconds. Awaited
+    /// acks use [`ContextBuilder::timeout`].
+    pub fn ack_timeout(self, ack_timeout: Duration) -> ContextBuilder<Yes>
+    where
+        Yes: ToAssign,
+    {
+        ContextBuilder {
+            prefix: self.prefix,
+            timeout: self.timeout,
+            semaphore_capacity: self.semaphore_capacity,
+            ack_timeout,
+            backpressure_on_inflight: self.backpressure_on_inflight,
+            concurrency_limit: self.concurrency_limit,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Sets the maximum number of pending acks that can be in flight at any given time.
+    /// If limit is reached, `publish` throws an error by default, or waits if backpressure is enabled.
+    pub fn max_ack_inflight(self, capacity: usize) -> ContextBuilder<Yes>
+    where
+        Yes: ToAssign,
+    {
+        ContextBuilder {
+            prefix: self.prefix,
+            timeout: self.timeout,
+            semaphore_capacity: capacity,
+            ack_timeout: self.ack_timeout,
+            backpressure_on_inflight: self.backpressure_on_inflight,
+            concurrency_limit: self.concurrency_limit,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Enable or disable backpressure when max inflight acks is reached.
+    /// When enabled, publish will wait for permits to become available instead of returning an
+    /// error.
+    /// Default is false (errors on max inflight).
+    pub fn backpressure_on_inflight(self, enabled: bool) -> ContextBuilder<Yes>
+    where
+        Yes: ToAssign,
+    {
+        ContextBuilder {
+            prefix: self.prefix,
+            timeout: self.timeout,
+            semaphore_capacity: self.semaphore_capacity,
+            ack_timeout: self.ack_timeout,
+            backpressure_on_inflight: enabled,
+            concurrency_limit: self.concurrency_limit,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Sets the concurrency limit for the ack handler task. This might be useful
+    /// in scenarios where Tokio runtime is under heavy load.
+    pub fn concurrency_limit(self, limit: Option<usize>) -> ContextBuilder<Yes>
+    where
+        Yes: ToAssign,
+    {
+        ContextBuilder {
+            prefix: self.prefix,
+            timeout: self.timeout,
+            semaphore_capacity: self.semaphore_capacity,
+            ack_timeout: self.ack_timeout,
+            backpressure_on_inflight: self.backpressure_on_inflight,
+            concurrency_limit: limit,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Build the [Context] with the given settings.
+    pub fn build(self, client: Client) -> Context {
+        let (tx, rx) = tokio::sync::mpsc::channel::<(
+            oneshot::Receiver<Message>,
+            OwnedSemaphorePermit,
+        )>(self.semaphore_capacity);
+        let stream = ReceiverStream::new(rx);
+        spawn_acker(stream, self.ack_timeout, self.concurrency_limit);
+        Context {
+            client,
+            prefix: self.prefix,
+            timeout: self.timeout,
+            max_ack_semaphore: Arc::new(tokio::sync::Semaphore::new(self.semaphore_capacity)),
+            ack_sender: tx,
+            backpressure_on_inflight: self.backpressure_on_inflight,
+            semaphore_capacity: self.semaphore_capacity,
+        }
+    }
 }
 
 impl Context {
     pub(crate) fn new(client: Client) -> Context {
-        Context {
-            client,
-            prefix: "$JS.API".to_string(),
-            timeout: Duration::from_secs(5),
-        }
+        ContextBuilder::default().build(client)
     }
 
+    /// Sets the timeout for JetStream API requests, publish acks and double acks, for this
+    /// context and the handles created from it afterwards. See [`ContextBuilder::timeout`].
     pub fn set_timeout(&mut self, timeout: Duration) {
-        self.timeout = timeout
+        self.timeout = Some(timeout);
     }
 
+    /// The context timeout, or its default: the wait for publish acks and double acks.
+    pub(crate) fn timeout_or_default(&self) -> Duration {
+        self.timeout.unwrap_or(DEFAULT_TIMEOUT)
+    }
+
+    /// Bounds `request` by the context timeout unless it sets its own. With neither, the
+    /// connection's request timeout applies.
+    pub(crate) fn apply_timeout(
+        &self,
+        mut request: crate::client::Request,
+    ) -> crate::client::Request {
+        if request.timeout.is_none() {
+            request.timeout = self.timeout.map(Some);
+        }
+        request
+    }
+
+    /// A copy of the context for the requests of background recovery, such as ordered consumer
+    /// recreation. Nothing awaits those requests directly, so with neither a context timeout nor
+    /// a connection request timeout they fall back to 10 seconds instead of waiting forever.
+    pub(crate) fn recovery_context(&self) -> Context {
+        let mut context = self.clone();
+        if context.timeout.is_none() && context.client.timeout().is_none() {
+            context.timeout = Some(RECOVERY_TIMEOUT);
+        }
+        context
+    }
+
+    /// Return a clone of the underlying NATS client.
+    pub fn client(&self) -> Client {
+        self.client.clone()
+    }
+
+    /// Waits until all pending `acks` are received from the server.
+    /// Be aware that this is probably not the way you want to await `acks`,
+    /// as it will wait for every `ack` that is pending, including those that might
+    /// be published after you call this method.
+    /// Useful in testing, or maybe batching.
+    pub async fn wait_for_acks(&self) {
+        self.max_ack_semaphore
+            .acquire_many(self.semaphore_capacity as u32)
+            .await
+            .ok();
+    }
+
+    /// Create a new [Context] with given API prefix.
     pub(crate) fn with_prefix<T: ToString>(client: Client, prefix: T) -> Context {
-        Context {
-            client,
-            prefix: prefix.to_string(),
-            timeout: Duration::from_secs(5),
-        }
+        ContextBuilder::new()
+            .api_prefix(prefix.to_string())
+            .build(client)
     }
 
+    /// Create a new [Context] with given domain.
     pub(crate) fn with_domain<T: AsRef<str>>(client: Client, domain: T) -> Context {
-        Context {
-            client,
-            prefix: format!("$JS.{}.API", domain.as_ref()),
-            timeout: Duration::from_secs(5),
-        }
+        ContextBuilder::new().domain(domain.as_ref()).build(client)
     }
 
     /// Publishes [jetstream::Message][super::message::Message] to the [Stream] without waiting for
@@ -132,7 +474,7 @@ impl Context {
         subject: S,
         payload: Bytes,
     ) -> Result<PublishAckFuture, PublishError> {
-        self.send_publish(subject, Publish::build().payload(payload))
+        self.send_publish(subject, PublishMessage::build().payload(payload))
             .await
     }
 
@@ -163,8 +505,11 @@ impl Context {
         headers: crate::header::HeaderMap,
         payload: Bytes,
     ) -> Result<PublishAckFuture, PublishError> {
-        self.send_publish(subject, Publish::build().payload(payload).headers(headers))
-            .await
+        self.send_publish(
+            subject,
+            PublishMessage::build().payload(payload).headers(headers),
+        )
+        .await
     }
 
     /// Publish a message built by [Publish] and returns an acknowledgment future.
@@ -192,9 +537,44 @@ impl Context {
     pub async fn send_publish<S: ToSubject>(
         &self,
         subject: S,
-        publish: Publish,
+        publish: PublishMessage,
     ) -> Result<PublishAckFuture, PublishError> {
-        let subject = subject.to_subject();
+        let subject = self
+            .client
+            .maybe_validate_publish_subject(subject)
+            .map_err(|e| PublishError::with_source(PublishErrorKind::Other, e))?;
+
+        // Reject oversized messages before taking an ack permit, else the
+        // publish is sent and we wait for an ack that never arrives.
+        self.client
+            .check_payload_size(publish.headers.as_ref(), publish.payload.len())
+            .map_err(|sizes| {
+                PublishError::with_source(
+                    PublishErrorKind::MaxPayloadExceeded,
+                    crate::client::max_payload_message(sizes),
+                )
+            })?;
+
+        let permit = if self.backpressure_on_inflight {
+            // When backpressure is enabled, wait for a permit to become available
+            self.max_ack_semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|err| PublishError::with_source(PublishErrorKind::Other, err))?
+        } else {
+            // When backpressure is disabled, error immediately if no permits available
+            self.max_ack_semaphore
+                .clone()
+                .try_acquire_owned()
+                .map_err(|err| match err {
+                    TryAcquireError::NoPermits => {
+                        PublishError::new(PublishErrorKind::MaxAckPending)
+                    }
+                    _ => PublishError::with_source(PublishErrorKind::Other, err),
+                })?
+        };
+
         let (sender, receiver) = oneshot::channel();
 
         let respond = self.client.new_inbox().into();
@@ -211,13 +591,16 @@ impl Context {
             })
             .map_err(|err| PublishError::with_source(PublishErrorKind::Other, err));
 
-        tokio::time::timeout(self.timeout, send_fut)
+        let timeout = self.timeout_or_default();
+        tokio::time::timeout(timeout, send_fut)
             .map_err(|_elapsed| PublishError::new(PublishErrorKind::TimedOut))
             .await??;
 
         Ok(PublishAckFuture {
-            timeout: self.timeout,
-            subscription: receiver,
+            timeout,
+            subscription: Some(receiver),
+            permit: Some(permit),
+            tx: self.ack_sender.clone(),
         })
     }
 
@@ -697,13 +1080,15 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "kv")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kv")))]
     pub async fn get_key_value<T: Into<String>>(&self, bucket: T) -> Result<Store, KeyValueError> {
         let bucket: String = bucket.into();
         if !crate::jetstream::kv::is_valid_bucket_name(&bucket) {
             return Err(KeyValueError::new(KeyValueErrorKind::InvalidStoreName));
         }
 
-        let stream_name = format!("KV_{}", &bucket);
+        let stream_name = format!("KV_{}", bucket);
         let stream = self
             .get_stream(stream_name.clone())
             .map_err(|err| KeyValueError::with_source(KeyValueErrorKind::GetBucket, err))
@@ -713,7 +1098,7 @@ impl Context {
             return Err(KeyValueError::new(KeyValueErrorKind::InvalidStoreName));
         }
         let mut store = Store {
-            prefix: format!("$KV.{}.", &bucket),
+            prefix: format!("$KV.{}.", bucket),
             name: bucket,
             stream_name,
             stream: stream.clone(),
@@ -755,6 +1140,8 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "kv")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kv")))]
     pub async fn create_key_value(
         &self,
         config: crate::jetstream::kv::Config,
@@ -801,6 +1188,8 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "kv")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kv")))]
     pub async fn update_key_value(
         &self,
         config: crate::jetstream::kv::Config,
@@ -846,7 +1235,7 @@ impl Context {
     /// let client = async_nats::connect("demo.nats.io:4222").await?;
     /// let jetstream = async_nats::jetstream::new(client);
     /// let kv = jetstream
-    ///     .update_key_value(async_nats::jetstream::kv::Config {
+    ///     .create_or_update_key_value(async_nats::jetstream::kv::Config {
     ///         bucket: "kv".to_string(),
     ///         history: 60,
     ///         ..Default::default()
@@ -855,6 +1244,8 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "kv")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kv")))]
     pub async fn create_or_update_key_value(
         &self,
         config: crate::jetstream::kv::Config,
@@ -906,6 +1297,8 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "kv")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kv")))]
     pub async fn delete_key_value<T: AsRef<str>>(
         &self,
         bucket: T,
@@ -1196,6 +1589,8 @@ impl Context {
     ///
     /// This is a low level API used mostly internally, that should be used only in
     /// specific cases when this crate API on [Consumer] or [Stream] does not provide needed functionality.
+    /// The request is bounded by the context timeout when one was set, otherwise by the
+    /// connection's request timeout, see [`ContextBuilder::timeout`].
     ///
     /// # Examples
     ///
@@ -1218,17 +1613,17 @@ impl Context {
         V: DeserializeOwned,
     {
         let subject = subject.to_subject();
-        let request = serde_json::to_vec(&payload)
+        let body = serde_json::to_vec(&payload)
             .map(Bytes::from)
             .map_err(|err| RequestError::with_source(RequestErrorKind::Other, err))?;
 
-        debug!("JetStream request sent: {:?}", request);
+        debug!("JetStream request sent: {:?}", body);
 
+        let request = self.apply_timeout(crate::client::Request::new().payload(body));
         let message = self
             .client
-            .request(format!("{}.{}", self.prefix, subject.as_ref()), request)
-            .await;
-        let message = message?;
+            .send_request(format!("{}.{}", self.prefix, subject.as_ref()), request)
+            .await?;
         debug!(
             "JetStream request response: {:?}",
             from_utf8(&message.payload)
@@ -1237,6 +1632,37 @@ impl Context {
             .map_err(|err| RequestError::with_source(RequestErrorKind::Other, err))?;
 
         Ok(response)
+    }
+
+    /// Send a JetStream API request without waiting for a response.
+    /// The subject will be automatically prefixed with the JetStream API prefix.
+    ///
+    /// This is useful for operations that need custom response handling,
+    /// such as streaming responses (batch get) where the caller manages
+    /// their own subscription to the reply inbox.
+    ///
+    /// Used mostly by extension crates.
+    pub async fn send_request<S: ToSubject>(
+        &self,
+        subject: S,
+        request: crate::client::Request,
+    ) -> Result<(), crate::PublishError> {
+        let prefixed_subject = format!("{}.{}", self.prefix, subject.to_subject());
+        let inbox = request.inbox.unwrap_or_else(|| self.client.new_inbox());
+        let payload = request.payload.unwrap_or_default();
+
+        match request.headers {
+            Some(headers) => {
+                self.client
+                    .publish_with_reply_and_headers(prefixed_subject, inbox, headers, payload)
+                    .await
+            }
+            None => {
+                self.client
+                    .publish_with_reply(prefixed_subject, inbox, payload)
+                    .await
+            }
+        }
     }
 
     /// Creates a new object store bucket.
@@ -1257,6 +1683,8 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "object-store")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "object-store")))]
     pub async fn create_object_store(
         &self,
         config: super::object_store::Config,
@@ -1317,6 +1745,8 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "object-store")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "object-store")))]
     pub async fn get_object_store<T: AsRef<str>>(
         &self,
         bucket_name: T,
@@ -1352,6 +1782,8 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "object-store")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "object-store")))]
     pub async fn delete_object_store<T: AsRef<str>>(
         &self,
         bucket_name: T,
@@ -1364,6 +1796,104 @@ impl Context {
     }
 }
 
+impl crate::client::traits::Requester for Context {
+    /// Sends a raw request, with the subject as is, without the API prefix. It is bounded by the
+    /// context timeout when one was set, otherwise by the connection's request timeout, see
+    /// [`ContextBuilder::timeout`]. A timeout set with
+    /// [`Request::timeout`](crate::Request::timeout) replaces both, including `None`, which
+    /// leaves the request unbounded.
+    fn send_request<S: ToSubject>(
+        &self,
+        subject: S,
+        request: crate::Request,
+    ) -> impl Future<Output = Result<Message, crate::RequestError>> {
+        self.client
+            .send_request(subject, self.apply_timeout(request))
+    }
+}
+
+impl crate::client::traits::Publisher for Context {
+    fn publish_with_reply<S, R>(
+        &self,
+        subject: S,
+        reply: R,
+        payload: Bytes,
+    ) -> impl Future<Output = Result<(), crate::PublishError>>
+    where
+        S: ToSubject,
+        R: ToSubject,
+    {
+        self.client.publish_with_reply(subject, reply, payload)
+    }
+
+    fn publish_message(
+        &self,
+        msg: crate::message::OutboundMessage,
+    ) -> impl Future<Output = Result<(), crate::PublishError>> {
+        self.client.publish_message(msg)
+    }
+}
+
+impl traits::ClientProvider for Context {
+    fn client(&self) -> crate::Client {
+        self.client()
+    }
+}
+
+impl traits::Requester for Context {
+    fn request<S, T, V>(
+        &self,
+        subject: S,
+        payload: &T,
+    ) -> impl Future<Output = Result<V, RequestError>>
+    where
+        S: ToSubject,
+        T: ?Sized + Serialize,
+        V: DeserializeOwned,
+    {
+        self.request(subject, payload)
+    }
+}
+
+impl traits::TimeoutProvider for Context {
+    fn timeout(&self) -> Duration {
+        self.timeout_or_default()
+    }
+}
+
+impl traits::RequestSender for Context {
+    fn send_request<S: ToSubject>(
+        &self,
+        subject: S,
+        request: crate::client::Request,
+    ) -> impl Future<Output = Result<(), crate::PublishError>> {
+        self.send_request(subject, request)
+    }
+}
+
+impl traits::Publisher for Context {
+    fn publish<S: ToSubject>(
+        &self,
+        subject: S,
+        payload: Bytes,
+    ) -> impl Future<Output = Result<PublishAckFuture, PublishError>> {
+        self.publish(subject, payload)
+    }
+
+    fn publish_message(
+        &self,
+        message: jetstream::message::OutboundMessage,
+    ) -> impl Future<Output = Result<PublishAckFuture, PublishError>> {
+        self.send_publish(
+            message.subject,
+            PublishMessage {
+                payload: message.payload,
+                headers: message.headers,
+            },
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PublishErrorKind {
     StreamNotFound,
@@ -1371,6 +1901,9 @@ pub enum PublishErrorKind {
     WrongLastSequence,
     TimedOut,
     BrokenPipe,
+    MaxAckPending,
+    /// The message (payload plus headers) exceeds the server's `max_payload`.
+    MaxPayloadExceeded,
     Other,
 }
 
@@ -1383,6 +1916,8 @@ impl Display for PublishErrorKind {
             Self::BrokenPipe => write!(f, "broken pipe"),
             Self::WrongLastMessageId => write!(f, "wrong last message id"),
             Self::WrongLastSequence => write!(f, "wrong last sequence"),
+            Self::MaxAckPending => write!(f, "max ack pending reached"),
+            Self::MaxPayloadExceeded => write!(f, "max payload size exceeded"),
         }
     }
 }
@@ -1392,12 +1927,24 @@ pub type PublishError = Error<PublishErrorKind>;
 #[derive(Debug)]
 pub struct PublishAckFuture {
     timeout: Duration,
-    subscription: oneshot::Receiver<Message>,
+    subscription: Option<oneshot::Receiver<Message>>,
+    permit: Option<OwnedSemaphorePermit>,
+    tx: mpsc::Sender<(oneshot::Receiver<Message>, OwnedSemaphorePermit)>,
+}
+
+impl Drop for PublishAckFuture {
+    fn drop(&mut self) {
+        if let (Some(sub), Some(permit)) = (self.subscription.take(), self.permit.take()) {
+            if let Err(err) = self.tx.try_send((sub, permit)) {
+                tracing::warn!("failed to pass future permit to the acker: {}", err);
+            }
+        }
+    }
 }
 
 impl PublishAckFuture {
-    async fn next_with_timeout(self) -> Result<PublishAck, PublishError> {
-        let next = tokio::time::timeout(self.timeout, self.subscription)
+    async fn next_with_timeout(mut self) -> Result<PublishAck, PublishError> {
+        let next = tokio::time::timeout(self.timeout, self.subscription.take().unwrap())
             .await
             .map_err(|_| PublishError::new(PublishErrorKind::TimedOut))?;
         next.map_or_else(
@@ -1597,84 +2144,20 @@ impl futures_util::Stream for Streams {
         }
     }
 }
-/// Used for building customized `publish` message.
-#[derive(Default, Clone, Debug)]
-pub struct Publish {
-    payload: Bytes,
-    headers: Option<header::HeaderMap>,
-}
-impl Publish {
-    /// Creates a new custom Publish struct to be used with.
-    pub fn build() -> Self {
-        Default::default()
-    }
 
-    /// Sets the payload for the message.
-    pub fn payload(mut self, payload: Bytes) -> Self {
-        self.payload = payload;
-        self
-    }
-    /// Adds headers to the message.
-    pub fn headers(mut self, headers: HeaderMap) -> Self {
-        self.headers = Some(headers);
-        self
-    }
-    /// A shorthand to add a single header.
-    pub fn header<N: IntoHeaderName, V: IntoHeaderValue>(mut self, name: N, value: V) -> Self {
-        self.headers
-            .get_or_insert(header::HeaderMap::new())
-            .insert(name, value);
-        self
-    }
-    /// Sets the `Nats-Msg-Id` header, that is used by stream deduplicate window.
-    pub fn message_id<T: AsRef<str>>(self, id: T) -> Self {
-        self.header(header::NATS_MESSAGE_ID, id.as_ref())
-    }
-    /// Sets expected last message ID.
-    /// It sets the `Nats-Expected-Last-Msg-Id` header with provided value.
-    pub fn expected_last_message_id<T: AsRef<str>>(self, last_message_id: T) -> Self {
-        self.header(
-            header::NATS_EXPECTED_LAST_MESSAGE_ID,
-            last_message_id.as_ref(),
-        )
-    }
-    /// Sets the last expected stream sequence.
-    /// It sets the `Nats-Expected-Last-Sequence` header with provided value.
-    pub fn expected_last_sequence(self, last_sequence: u64) -> Self {
-        self.header(
-            header::NATS_EXPECTED_LAST_SEQUENCE,
-            HeaderValue::from(last_sequence),
-        )
-    }
-    /// Sets the last expected stream sequence for a subject this message will be published to.
-    /// It sets the `Nats-Expected-Last-Subject-Sequence` header with provided value.
-    pub fn expected_last_subject_sequence(self, subject_sequence: u64) -> Self {
-        self.header(
-            header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
-            HeaderValue::from(subject_sequence),
-        )
-    }
-    /// Sets the expected stream name.
-    /// It sets the `Nats-Expected-Stream` header with provided value.
-    pub fn expected_stream<T: AsRef<str>>(self, stream: T) -> Self {
-        self.header(
-            header::NATS_EXPECTED_STREAM,
-            HeaderValue::from(stream.as_ref()),
-        )
-    }
-
-    #[cfg(feature = "server_2_11")]
-    /// Sets TTL for a single message.
-    /// It sets the `Nats-TTL` header with provided value.
-    pub fn ttl(self, ttl: Duration) -> Self {
-        self.header(header::NATS_MESSAGE_TTL, ttl.as_secs().to_string())
-    }
-}
+/// Alias to avoid breaking changes.
+/// Please use `jetstream::message::PublishMessage` instead.
+#[deprecated(
+    note = "use jetstream::message::PublishMessage instead",
+    since = "0.44.0"
+)]
+pub type Publish = super::message::PublishMessage;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RequestErrorKind {
     NoResponders,
     TimedOut,
+    InvalidSubject,
     Other,
 }
 
@@ -1683,6 +2166,7 @@ impl Display for RequestErrorKind {
         match self {
             Self::TimedOut => write!(f, "timed out"),
             Self::Other => write!(f, "request failed"),
+            Self::InvalidSubject => write!(f, "invalid subject"),
             Self::NoResponders => write!(f, "requested JetStream resource does not exist"),
         }
     }
@@ -1699,7 +2183,10 @@ impl From<crate::RequestError> for RequestError {
             crate::RequestErrorKind::NoResponders => {
                 RequestError::new(RequestErrorKind::NoResponders)
             }
-            crate::RequestErrorKind::Other => {
+            crate::RequestErrorKind::InvalidSubject => {
+                RequestError::with_source(RequestErrorKind::InvalidSubject, error)
+            }
+            crate::RequestErrorKind::MaxPayloadExceeded | crate::RequestErrorKind::Other => {
                 RequestError::with_source(RequestErrorKind::Other, error)
             }
         }
@@ -1760,6 +2247,9 @@ impl From<RequestError> for ConsumerInfoError {
     fn from(error: RequestError) -> Self {
         match error.kind() {
             RequestErrorKind::TimedOut => ConsumerInfoError::new(ConsumerInfoErrorKind::TimedOut),
+            RequestErrorKind::InvalidSubject => {
+                ConsumerInfoError::with_source(ConsumerInfoErrorKind::InvalidName, error)
+            }
             RequestErrorKind::Other => {
                 ConsumerInfoError::with_source(ConsumerInfoErrorKind::Request, error)
             }
@@ -1819,6 +2309,9 @@ impl From<RequestError> for CreateStreamError {
                 CreateStreamError::new(CreateStreamErrorKind::JetStreamUnavailable)
             }
             RequestErrorKind::TimedOut => CreateStreamError::new(CreateStreamErrorKind::TimedOut),
+            RequestErrorKind::InvalidSubject => {
+                CreateStreamError::with_source(CreateStreamErrorKind::InvalidStreamName, error)
+            }
             RequestErrorKind::Other => {
                 CreateStreamError::with_source(CreateStreamErrorKind::Response, error)
             }
@@ -1872,6 +2365,7 @@ pub type UpdateStreamErrorKind = CreateStreamErrorKind;
 pub type DeleteStreamError = GetStreamError;
 pub type DeleteStreamErrorKind = GetStreamErrorKind;
 
+#[cfg(feature = "kv")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum KeyValueErrorKind {
     InvalidStoreName,
@@ -1879,6 +2373,7 @@ pub enum KeyValueErrorKind {
     JetStream,
 }
 
+#[cfg(feature = "kv")]
 impl Display for KeyValueErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1889,8 +2384,10 @@ impl Display for KeyValueErrorKind {
     }
 }
 
+#[cfg(feature = "kv")]
 pub type KeyValueError = Error<KeyValueErrorKind>;
 
+#[cfg(any(feature = "kv", feature = "object-store"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CreateKeyValueErrorKind {
     InvalidStoreName,
@@ -1901,6 +2398,7 @@ pub enum CreateKeyValueErrorKind {
     LimitMarkersNotSupported,
 }
 
+#[cfg(any(feature = "kv", feature = "object-store"))]
 impl Display for CreateKeyValueErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1916,6 +2414,7 @@ impl Display for CreateKeyValueErrorKind {
     }
 }
 
+#[cfg(feature = "kv")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum UpdateKeyValueErrorKind {
     InvalidStoreName,
@@ -1927,6 +2426,7 @@ pub enum UpdateKeyValueErrorKind {
     NotFound,
 }
 
+#[cfg(feature = "kv")]
 impl Display for UpdateKeyValueErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1942,18 +2442,24 @@ impl Display for UpdateKeyValueErrorKind {
         }
     }
 }
+#[cfg(feature = "kv")]
 pub type CreateKeyValueError = Error<CreateKeyValueErrorKind>;
+#[cfg(feature = "kv")]
 pub type UpdateKeyValueError = Error<UpdateKeyValueErrorKind>;
 
-pub type CreateObjectStoreError = CreateKeyValueError;
+#[cfg(feature = "object-store")]
+pub type CreateObjectStoreError = Error<CreateKeyValueErrorKind>;
+#[cfg(feature = "object-store")]
 pub type CreateObjectStoreErrorKind = CreateKeyValueErrorKind;
 
+#[cfg(feature = "object-store")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ObjectStoreErrorKind {
     InvalidBucketName,
     GetStore,
 }
 
+#[cfg(feature = "object-store")]
 impl Display for ObjectStoreErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1963,9 +2469,12 @@ impl Display for ObjectStoreErrorKind {
     }
 }
 
+#[cfg(feature = "object-store")]
 pub type ObjectStoreError = Error<ObjectStoreErrorKind>;
 
+#[cfg(feature = "object-store")]
 pub type DeleteObjectStore = ObjectStoreError;
+#[cfg(feature = "object-store")]
 pub type DeleteObjectStoreKind = ObjectStoreErrorKind;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1996,7 +2505,9 @@ impl From<RequestError> for AccountError {
                 AccountError::with_source(AccountErrorKind::JetStreamUnavailable, err)
             }
             RequestErrorKind::TimedOut => AccountError::new(AccountErrorKind::TimedOut),
-            RequestErrorKind::Other => AccountError::with_source(AccountErrorKind::Other, err),
+            RequestErrorKind::Other | RequestErrorKind::InvalidSubject => {
+                AccountError::with_source(AccountErrorKind::Other, err)
+            }
         }
     }
 }
@@ -2013,6 +2524,7 @@ enum ConsumerAction {
     Update,
 }
 
+#[cfg(feature = "kv")]
 // Maps a Stream config to KV Store.
 fn map_to_kv(stream: super::stream::Stream, prefix: String, bucket: String) -> Store {
     let mut store = Store {
@@ -2038,12 +2550,14 @@ fn map_to_kv(stream: super::stream::Stream, prefix: String, bucket: String) -> S
     store
 }
 
+#[cfg(feature = "kv")]
 enum KvToStreamConfigError {
     TooLongHistory,
     #[allow(dead_code)]
     LimitMarkersNotSupported,
 }
 
+#[cfg(feature = "kv")]
 impl From<KvToStreamConfigError> for CreateKeyValueError {
     fn from(err: KvToStreamConfigError) -> Self {
         match err {
@@ -2057,6 +2571,7 @@ impl From<KvToStreamConfigError> for CreateKeyValueError {
     }
 }
 
+#[cfg(feature = "kv")]
 impl From<KvToStreamConfigError> for UpdateKeyValueError {
     fn from(err: KvToStreamConfigError) -> Self {
         match err {
@@ -2070,9 +2585,10 @@ impl From<KvToStreamConfigError> for UpdateKeyValueError {
     }
 }
 
+#[cfg(feature = "kv")]
 // Maps the KV config to Stream config.
 fn kv_to_stream_config(
-    config: kv::Config,
+    config: crate::jetstream::kv::Config,
     _account: Account,
 ) -> Result<super::stream::Config, KvToStreamConfigError> {
     let history = if config.history > 0 {
@@ -2122,7 +2638,7 @@ fn kv_to_stream_config(
         subjects = vec![format!("$KV.{}.>", config.bucket)];
     }
 
-    Ok(stream::Config {
+    Ok(Config {
         name: format!("KV_{}", config.bucket),
         description: Some(config.description),
         subjects,
@@ -2139,11 +2655,11 @@ fn kv_to_stream_config(
         sources,
         mirror,
         num_replicas,
-        discard: stream::DiscardPolicy::New,
+        discard: DiscardPolicy::New,
         mirror_direct,
         #[cfg(feature = "server_2_10")]
         compression: if config.compression {
-            Some(stream::Compression::S2)
+            Some(Compression::S2)
         } else {
             None
         },

@@ -13,11 +13,13 @@
 
 #[cfg(feature = "service")]
 mod service {
-    use std::{collections::HashMap, str::from_utf8};
-
+    use async_nats::client::PublishErrorKind;
     use async_nats::service::{self, Info, ServiceExt, Stats};
     use futures_util::StreamExt;
     use jsonschema::JSONSchema;
+    use std::error::Error;
+    use std::fmt::Display;
+    use std::{collections::HashMap, str::from_utf8};
     use tracing::debug;
 
     #[tokio::test]
@@ -320,6 +322,45 @@ mod service {
     }
 
     #[tokio::test]
+    async fn respond_error_with_line_breaks() {
+        let server = nats_server::run_basic_server();
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+
+        let service = client
+            .service_builder()
+            .start("serviceA", "1.0.0")
+            .await
+            .unwrap();
+        let mut endpoint = service.endpoint("products").await.unwrap();
+        let reply = client.new_inbox();
+        let mut response = client.subscribe(reply.to_owned()).await.unwrap();
+        client
+            .publish_with_reply("products", reply, "data".into())
+            .await
+            .unwrap();
+
+        let request = endpoint.next().await.unwrap();
+        request
+            .respond(Err(async_nats::service::error::Error {
+                code: 400,
+                status: "bad\r\nX-Injected: yes".into(),
+            }))
+            .await
+            .unwrap();
+
+        // line breaks become spaces, as nats.go does, so they cannot start a new header.
+        let headers = response.next().await.unwrap().headers.unwrap();
+        assert_eq!(
+            headers
+                .get(async_nats::service::NATS_SERVICE_ERROR)
+                .unwrap()
+                .as_str(),
+            "bad  X-Injected: yes"
+        );
+        assert!(headers.get("X-Injected").is_none());
+    }
+
+    #[tokio::test]
     async fn custom_queue_groups() {
         let server = nats_server::run_basic_server();
         let client = async_nats::connect(server.client_url()).await.unwrap();
@@ -458,9 +499,28 @@ mod service {
         let server = nats_server::run_basic_server();
         let client = async_nats::connect(server.client_url()).await.unwrap();
 
+        struct SemVer {
+            major: i32,
+            minor: i32,
+            patch: i32,
+        }
+
+        impl Display for SemVer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+            }
+        }
+
         let service = client
             .service_builder()
-            .start("service", "1.0.0")
+            .start(
+                "service",
+                SemVer {
+                    major: 1,
+                    minor: 0,
+                    patch: 0,
+                },
+            )
             .await
             .unwrap();
 
@@ -490,6 +550,7 @@ mod service {
         .unwrap();
 
         assert_eq!(&endpoint_info, info.endpoints.first().unwrap());
+        assert_eq!(vec![endpoint_info], service.info().await.endpoints);
     }
 
     #[tokio::test]
@@ -571,6 +632,47 @@ mod service {
     }
 
     #[tokio::test]
+    async fn stop_without_endpoints() {
+        let server = nats_server::run_basic_server();
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+
+        let service = client
+            .service_builder()
+            .start("service", "1.0.0")
+            .await
+            .unwrap();
+
+        service.stop().await.unwrap();
+        client.flush().await.unwrap();
+
+        // a stopped service answers no discovery request
+        let err = client.request("$SRV.PING", "".into()).await.unwrap_err();
+        assert_eq!(err.kind(), async_nats::RequestErrorKind::NoResponders);
+    }
+
+    #[tokio::test]
+    async fn stop_after_endpoint_dropped() {
+        let server = nats_server::run_basic_server();
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+
+        let service = client
+            .service_builder()
+            .start("service", "1.0.0")
+            .await
+            .unwrap();
+
+        let endpoint = service.endpoint("products").await.unwrap();
+        drop(endpoint);
+
+        service.stop().await.unwrap();
+        client.flush().await.unwrap();
+
+        // a stopped service answers no discovery request
+        let err = client.request("$SRV.PING", "".into()).await.unwrap_err();
+        assert_eq!(err.kind(), async_nats::RequestErrorKind::NoResponders);
+    }
+
+    #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn cross_clients_tests() {
         use std::process::Command;
@@ -607,5 +709,58 @@ mod service {
         });
 
         Command::new("deno").args(["run", "-A", "--unstable", "https://raw.githubusercontent.com/nats-io/nats.deno/main/tests/helpers/service-check.ts", "--server", &server.client_url(), "--name", "cross"]).output().unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_reply_subject() {
+        let server = nats_server::run_basic_server();
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+
+        let service = client
+            .service_builder()
+            .queue_group("service")
+            .start("service", "1.0.0")
+            .await
+            .unwrap();
+
+        let mut endpoint = service.endpoint("endpoint").await.unwrap();
+
+        // publish without reply
+        client.publish("endpoint", "request".into()).await.unwrap();
+
+        let request = endpoint.next().await.unwrap();
+        let err = request.respond(Ok("ok".into())).await.unwrap_err();
+        // check the correct error was returned
+        assert_eq!(err.kind(), PublishErrorKind::InvalidSubject);
+        assert!(err.source().is_some());
+    }
+
+    #[tokio::test]
+    async fn verbs_missing_reply_subject() {
+        let server = nats_server::run_basic_server();
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+
+        let _service = client
+            .service_builder()
+            .start("service", "1.0.0")
+            .await
+            .unwrap();
+
+        // publish without reply
+        for verb in ["PING", "INFO", "STATS"] {
+            client
+                .publish(format!("$SRV.{verb}"), "".into())
+                .await
+                .unwrap();
+        }
+        client.flush().await.unwrap();
+
+        // the service still answers every verb
+        for verb in ["PING", "INFO", "STATS"] {
+            client
+                .request(format!("$SRV.{verb}"), "".into())
+                .await
+                .unwrap();
+        }
     }
 }

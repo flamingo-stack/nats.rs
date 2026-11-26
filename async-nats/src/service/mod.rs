@@ -23,19 +23,20 @@ use std::{
 
 use bytes::Bytes;
 pub mod endpoint;
+use crate::datetime::{self, rfc3339, DateTime};
 use futures_util::{
     stream::{self, SelectAll},
     Future, StreamExt,
 };
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use time::serde::rfc3339;
-use time::OffsetDateTime;
+use std::sync::LazyLock;
 use tokio::{sync::broadcast::Sender, task::JoinHandle};
 use tracing::debug;
 
-use crate::{Client, Error, HeaderMap, Message, PublishError, Subscriber};
+use crate::{
+    client::PublishErrorKind, Client, Error, HeaderMap, Message, PublishError, Subscriber,
+};
 
 use self::endpoint::Endpoint;
 
@@ -46,12 +47,12 @@ pub const NATS_SERVICE_ERROR_CODE: &str = "Nats-Service-Error-Code";
 
 // uses recommended semver validation expression from
 // https://semver.org/#is-there-a-suggested-regular-expression-regex-to-check-a-semver-string
-static SEMVER: Lazy<Regex> = Lazy::new(|| {
+static SEMVER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$")
         .unwrap()
 });
 // From ADR-33: Name can only have A-Z, a-z, 0-9, dash, underscore.
-static NAME: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z0-9\-_]+$").unwrap());
+static NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9\-_]+$").unwrap());
 
 /// Represents state for all endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +90,7 @@ pub struct Stats {
     // Service version.
     pub version: String,
     #[serde(with = "rfc3339")]
-    pub started: OffsetDateTime,
+    pub started: DateTime,
     /// Statistics of all endpoints.
     pub endpoints: Vec<endpoint::Stats>,
 }
@@ -182,7 +183,11 @@ impl ServiceBuilder {
     }
 
     /// Starts the service with configured options.
-    pub async fn start<S: ToString>(self, name: S, version: S) -> Result<Service, Error> {
+    pub async fn start<N: ToString, V: ToString>(
+        self,
+        name: N,
+        version: V,
+    ) -> Result<Service, Error> {
         Service::add(
             self.client,
             Config {
@@ -280,7 +285,7 @@ pub trait ServiceExt {
     fn service_builder(&self) -> ServiceBuilder;
 }
 
-impl ServiceExt for crate::Client {
+impl ServiceExt for Client {
     type Output = Pin<Box<dyn Future<Output = Result<Service, crate::Error>> + Send>>;
 
     fn add_service(&self, config: Config) -> Self::Output {
@@ -319,7 +324,7 @@ pub struct Service {
     info: Info,
     client: Client,
     handle: JoinHandle<Result<(), Error>>,
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    shutdown_tx: Sender<()>,
     subjects: Arc<Mutex<Vec<String>>>,
     queue_group: String,
 }
@@ -347,8 +352,8 @@ impl Service {
         let queue_group = config
             .queue_group
             .unwrap_or(DEFAULT_QUEUE_GROUP.to_string());
-        let id = nuid::next().to_string();
-        let started = time::OffsetDateTime::now_utc();
+        let id = crate::id_generator::next();
+        let started = datetime::now();
         let subjects = Arc::new(Mutex::new(Vec::new()));
         let info = Info {
             kind: "io.nats.micro.v1.info_response".to_string(),
@@ -380,6 +385,7 @@ impl Service {
                 loop {
                     tokio::select! {
                         Some(ping) = pings.next() => {
+                            let Some(reply) = ping.reply else { continue };
                             let pong = serde_json::to_vec(&PingResponse{
                                 kind: "io.nats.micro.v1.ping_response".to_string(),
                                 name: info.name.clone(),
@@ -387,29 +393,16 @@ impl Service {
                                 version: info.version.clone(),
                                 metadata: info.metadata.clone(),
                             })?;
-                            client.publish(ping.reply.unwrap(), pong.into()).await?;
+                            client.publish(reply, pong.into()).await?;
                         },
                         Some(info_request) = infos.next() => {
-                            let info = info.clone();
-
-                            let endpoints: Vec<endpoint::Info> = {
-                                endpoints_state.lock().unwrap().endpoints.values().map(|value| {
-                                    endpoint::Info {
-                                        name: value.name.to_owned(),
-                                        subject: value.subject.to_owned(),
-                                        queue_group: value.queue_group.to_owned(),
-                                        metadata: value.metadata.to_owned()
-                                    }
-                                }).collect()
-                            };
-                            let info = Info {
-                                endpoints,
-                                ..info
-                            };
+                            let Some(reply) = info_request.reply else { continue };
+                            let info = info_with_endpoints(&info, &endpoints_state);
                             let info_json = serde_json::to_vec(&info).map(Bytes::from)?;
-                            client.publish(info_request.reply.unwrap(), info_json.clone()).await?;
+                            client.publish(reply, info_json.clone()).await?;
                         },
                         Some(stats_request) = stats.next() => {
+                            let Some(reply) = stats_request.reply else { continue };
                             if let Some(stats_callback) = stats_callback.as_mut() {
                                 let mut endpoint_stats_locked = endpoints_state.lock().unwrap();
                                 for (key, value) in &mut endpoint_stats_locked.endpoints {
@@ -425,7 +418,7 @@ impl Service {
                                 started,
                                 endpoints: endpoints_state.lock().unwrap().endpoints.values().cloned().map(Into::into).collect(),
                             })?;
-                            client.publish(stats_request.reply.unwrap(), stats.into()).await?;
+                            client.publish(reply, stats.into()).await?;
                         },
                         else => break,
                     }
@@ -448,7 +441,9 @@ impl Service {
     /// be scaled down by one instance. If it was the only running instance, it will effectively
     /// remove the service entirely.
     pub async fn stop(self) -> Result<(), Error> {
-        self.shutdown_tx.send(())?;
+        // Sending fails when no endpoint is listening, which leaves nothing to
+        // notify; the verb handler is stopped either way.
+        let _ = self.shutdown_tx.send(());
         self.handle.abort();
         Ok(())
     }
@@ -476,7 +471,7 @@ impl Service {
 
     /// Returns [Info] for this service instance.
     pub async fn info(&self) -> Info {
-        self.info.clone()
+        info_with_endpoints(&self.info, &self.endpoints_state)
     }
 
     /// Creates a group for endpoints under common prefix.
@@ -591,7 +586,7 @@ pub struct Group {
     prefix: String,
     stats: Arc<Mutex<Endpoints>>,
     client: Client,
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    shutdown_tx: Sender<()>,
     subjects: Arc<Mutex<Vec<String>>>,
     queue_group: String,
 }
@@ -665,14 +660,7 @@ impl Group {
     /// # }
     /// ```
     pub async fn endpoint<S: ToString>(&self, subject: S) -> Result<Endpoint, Error> {
-        let mut endpoint = EndpointBuilder::new(
-            self.client.clone(),
-            self.stats.clone(),
-            self.shutdown_tx.clone(),
-            self.subjects.clone(),
-            self.queue_group.clone(),
-        );
-        endpoint.prefix = Some(self.prefix.clone());
+        let endpoint = self.endpoint_builder();
         endpoint.add(subject.to_string()).await
     }
 
@@ -710,7 +698,7 @@ async fn verb_subscription(
     verb: Verb,
     name: String,
     id: String,
-) -> Result<futures_util::stream::Fuse<SelectAll<Subscriber>>, Error> {
+) -> Result<stream::Fuse<SelectAll<Subscriber>>, Error> {
     let verb_all = client
         .subscribe(format!("{SERVICE_API_PREFIX}.{verb}"))
         .await?;
@@ -721,6 +709,20 @@ async fn verb_subscription(
         .subscribe(format!("{SERVICE_API_PREFIX}.{verb}.{name}.{id}"))
         .await?;
     Ok(stream::select_all([verb_all, verb_id, verb_name]).fuse())
+}
+
+fn info_with_endpoints(info: &Info, endpoints_state: &Mutex<Endpoints>) -> Info {
+    let endpoints = endpoints_state
+        .lock()
+        .unwrap()
+        .endpoints
+        .values()
+        .map(endpoint::Info::from)
+        .collect();
+    Info {
+        endpoints,
+        ..info.clone()
+    }
 }
 
 type ShutdownReceiverFuture = Pin<
@@ -757,9 +759,61 @@ impl Request {
     /// # }
     /// ```
     pub async fn respond(&self, response: Result<Bytes, error::Error>) -> Result<(), PublishError> {
-        let reply = self.message.reply.clone().unwrap();
+        self.respond_with_headers(response, HeaderMap::new()).await
+    }
+
+    /// Sends response for the request with headers.
+    ///
+    /// On error responses, [Nats-Service-Error][NATS_SERVICE_ERROR] and
+    /// [Nats-Service-Error-Code][NATS_SERVICE_ERROR_CODE] are always set from the provided
+    /// [`error::Error`]. If the provided [HeaderMap] already contains values for either
+    /// of those headers, they will be overridden. All other user-supplied headers
+    /// are preserved.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// use async_nats::service::ServiceExt;
+    /// use futures_util::StreamExt;
+    /// # let client = async_nats::connect("demo.nats.io").await?;
+    /// # let mut service = client
+    /// #    .service_builder().start("serviceA", "1.0.0.1").await?;
+    /// let mut endpoint = service.endpoint("endpoint").await?;
+    /// let request = endpoint.next().await.unwrap();
+    /// let mut headers = async_nats::HeaderMap::new();
+    /// headers.insert("x-success", "true");
+    /// request
+    ///     .respond_with_headers(Ok("hello".into()), headers)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn respond_with_headers(
+        &self,
+        response: Result<Bytes, error::Error>,
+        mut headers: HeaderMap,
+    ) -> Result<(), PublishError> {
+        let reply = match self.message.reply.clone() {
+            None => {
+                return Err(PublishError::with_source(
+                    PublishErrorKind::InvalidSubject,
+                    "Request is missing reply subject to respond to",
+                ))
+            }
+            Some(subject) => subject,
+        };
         let result = match response {
-            Ok(payload) => self.client.publish(reply, payload).await,
+            Ok(payload) => {
+                if headers.is_empty() {
+                    self.client.publish(reply, payload).await
+                } else {
+                    self.client
+                        .publish_with_headers(reply, headers, payload)
+                        .await
+                }
+            }
             Err(err) => {
                 self.stats
                     .lock()
@@ -771,7 +825,6 @@ impl Request {
                         stats.errors += 1;
                     })
                     .or_default();
-                let mut headers = HeaderMap::new();
                 headers.insert(NATS_SERVICE_ERROR, err.status.as_str());
                 headers.insert(NATS_SERVICE_ERROR_CODE, err.code.to_string().as_str());
                 self.client
@@ -824,7 +877,7 @@ impl EndpointBuilder {
         }
     }
 
-    /// Name of the [Endpoint]. By default subject of the endpoint is used.
+    /// Name of the [Endpoint]. By default, the subject of the endpoint is used.
     pub fn name<S: ToString>(mut self, name: S) -> EndpointBuilder {
         self.name = Some(name.to_string());
         self
@@ -836,7 +889,7 @@ impl EndpointBuilder {
         self
     }
 
-    /// Custom queue group for the [Endpoint]. Otherwise it will be derived from group or service.
+    /// Custom queue group for the [Endpoint]. Otherwise, it will be derived from group or service.
     pub fn queue_group<S: ToString>(mut self, queue_group: S) -> EndpointBuilder {
         self.queue_group = queue_group.to_string();
         self
@@ -916,5 +969,102 @@ mod tests {
 
         assert_eq!(new_group.prefix, "test.v1");
         assert_eq!(new_group.queue_group, "custom_queue");
+    }
+
+    #[tokio::test]
+    async fn test_respond_with_headers_overrides_error_headers() {
+        let server = nats_server::run_basic_server();
+        let client = crate::connect(server.client_url()).await.unwrap();
+
+        let service = client
+            .service_builder()
+            .start("test-service", "1.0.0")
+            .await
+            .unwrap();
+
+        let subject = "test.subject";
+        let mut endpoint = service.endpoint(subject).await.unwrap();
+
+        let handler = async {
+            if let Some(request) = endpoint.next().await {
+                let mut resp_headers = HeaderMap::new();
+                resp_headers.insert("x-success", "false");
+                resp_headers.insert(NATS_SERVICE_ERROR, "user-supplied-value");
+                resp_headers.insert(NATS_SERVICE_ERROR_CODE, "999");
+
+                let err = error::Error {
+                    status: "internal-error".to_string(),
+                    code: 500,
+                };
+
+                request
+                    .respond_with_headers(Err(err), resp_headers)
+                    .await
+                    .expect("failed to send response");
+            }
+        };
+
+        let requester = crate::connect(server.client_url()).await.unwrap();
+        let request_fut = async { requester.request(subject, "".into()).await.unwrap() };
+
+        let (_, resp) = tokio::join!(handler, request_fut);
+
+        let headers = resp.headers.expect("expected headers on reply");
+        assert_eq!(headers.get("x-success").unwrap().as_str(), "false");
+        assert_eq!(
+            headers.get(NATS_SERVICE_ERROR).unwrap().as_str(),
+            "internal-error"
+        );
+        assert_eq!(
+            headers.get(NATS_SERVICE_ERROR_CODE).unwrap().as_str(),
+            "500"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_respond_with_headers_preserves_headers_on_success() {
+        let server = nats_server::run_basic_server();
+        let client = crate::connect(server.client_url()).await.unwrap();
+
+        let service = client
+            .service_builder()
+            .start("test-service", "1.0.0")
+            .await
+            .unwrap();
+
+        let subject = "test.subject";
+        let mut endpoint = service.endpoint(subject).await.unwrap();
+
+        let handler = async {
+            if let Some(request) = endpoint.next().await {
+                let mut resp_headers = HeaderMap::new();
+                resp_headers.insert("x-success", "false");
+                resp_headers.insert("x-request-id", "req-123");
+                resp_headers.insert(NATS_SERVICE_ERROR, "user-supplied-value");
+                resp_headers.insert(NATS_SERVICE_ERROR_CODE, "999");
+
+                request
+                    .respond_with_headers(Ok("ok".into()), resp_headers)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        let requester = crate::connect(server.client_url()).await.unwrap();
+        let request_fut = async { requester.request(subject, "".into()).await.unwrap() };
+
+        let (_, resp) = tokio::join!(handler, request_fut);
+
+        let headers = resp.headers.expect("expected headers on reply");
+        assert_eq!(headers.get("x-success").unwrap().as_str(), "false");
+        assert_eq!(headers.get("x-request-id").unwrap().as_str(), "req-123");
+        assert_eq!(
+            headers.get(NATS_SERVICE_ERROR).unwrap().as_str(),
+            "user-supplied-value"
+        );
+        assert_eq!(
+            headers.get(NATS_SERVICE_ERROR_CODE).unwrap().as_str(),
+            "999"
+        );
     }
 }

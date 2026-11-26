@@ -13,23 +13,46 @@
 
 use crate::auth::Auth;
 use crate::connector;
-use crate::{Client, ConnectError, Event, ToServerAddrs};
+use crate::connector::{ReconnectToServer, ReconnectToServerCallback, Server};
+use crate::{Client, ConnectError, Event, ServerInfo, ToServerAddrs};
+#[cfg(feature = "nkeys")]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+#[cfg(feature = "nkeys")]
 use base64::engine::Engine;
 use futures_util::Future;
 use std::collections::HashMap;
 use std::fmt::Formatter;
-use std::{
-    fmt,
-    path::{Path, PathBuf},
-    pin::Pin,
-    sync::Arc,
-    time::Duration,
-};
+use std::net::SocketAddr;
+#[cfg(feature = "nkeys")]
+use std::path::Path;
+use std::{fmt, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
+#[cfg(feature = "nkeys")]
 use tokio::io;
 use tokio_rustls::rustls;
 
 /// Connect options. Used to connect with NATS when custom config is needed.
+///
+/// # TLS
+///
+/// The client asks for TLS when any of these is set:
+/// [`require_tls(true)`](ConnectOptions::require_tls), [`tls_first()`](ConnectOptions::tls_first),
+/// a `tls://` or `wss://` server URL, also one given to
+/// [`Client::set_server_pool`](crate::Client::set_server_pool),
+/// [`add_root_certificates()`](ConnectOptions::add_root_certificates),
+/// [`add_client_certificate()`](ConnectOptions::add_client_certificate),
+/// [`tls_client_config()`](ConnectOptions::tls_client_config),
+/// [`tls_server_name()`](ConnectOptions::tls_server_name) or
+/// [`verify_discovered_servers_by_ip()`](ConnectOptions::verify_discovered_servers_by_ip).
+/// Every server is then connected to with TLS, servers discovered from the cluster and
+/// reconnects included, and a `ws://` URL is refused as a configuration error.
+/// [`tls_optional()`](ConnectOptions::tls_optional) opts out and leaves TLS to each server.
+///
+/// [`tls_server_name()`](ConnectOptions::tls_server_name) sets the name every server's
+/// certificate is verified against.
+/// [`verify_discovered_servers_by_ip()`](ConnectOptions::verify_discovered_servers_by_ip)
+/// verifies a discovered IP address against itself, for clusters whose certificates carry only
+/// IP addresses and whose CA is not shared with others.
+///
 /// # Examples
 /// ```no_run
 /// # #[tokio::main]
@@ -42,6 +65,7 @@ use tokio_rustls::rustls;
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone)]
 pub struct ConnectOptions {
     pub(crate) name: Option<String>,
     pub(crate) no_echo: bool,
@@ -50,6 +74,9 @@ pub struct ConnectOptions {
     pub(crate) auth: Auth,
     pub(crate) tls_required: bool,
     pub(crate) tls_first: bool,
+    pub(crate) tls_optional: bool,
+    pub(crate) tls_server_name: Option<String>,
+    pub(crate) verify_discovered_servers_by_ip: bool,
     pub(crate) certificates: Vec<PathBuf>,
     pub(crate) client_cert: Option<PathBuf>,
     pub(crate) client_key: Option<PathBuf>,
@@ -64,10 +91,12 @@ pub struct ConnectOptions {
     pub(crate) ignore_discovered_servers: bool,
     pub(crate) retain_servers_order: bool,
     pub(crate) read_buffer_capacity: u16,
-    pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
+    pub(crate) reconnect_delay_callback: Arc<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
+    pub(crate) skip_subject_validation: bool,
+    pub(crate) local_address: Option<SocketAddr>,
+    pub(crate) reconnect_to_server_callback: Option<ReconnectToServerCallback>,
     pub(crate) auth_url_callback: Option<CallbackArg1<(), Result<String, AuthError>>>,
-    /// Custom headers to be sent during WebSocket handshake.
     pub(crate) handshake_headers: HashMap<String, String>,
 }
 
@@ -84,12 +113,22 @@ impl fmt::Debug for ConnectOptions {
             .entry(&"client_key", &self.client_key)
             .entry(&"tls_client_config", &"XXXXXXXX")
             .entry(&"tls_first", &self.tls_first)
+            .entry(&"tls_optional", &self.tls_optional)
+            .entry(&"tls_server_name", &self.tls_server_name)
+            .entry(
+                &"verify_discovered_servers_by_ip",
+                &self.verify_discovered_servers_by_ip,
+            )
             .entry(&"ping_interval", &self.ping_interval)
             .entry(&"sender_capacity", &self.sender_capacity)
             .entry(&"inbox_prefix", &self.inbox_prefix)
             .entry(&"retry_on_initial_connect", &self.retry_on_initial_connect)
             .entry(&"read_buffer_capacity", &self.read_buffer_capacity)
-            .entry(&"handshake_headers", &self.handshake_headers.keys().collect::<Vec<_>>())
+            .entry(&"skip_subject_validation", &self.skip_subject_validation)
+            .entry(
+                &"handshake_headers",
+                &self.handshake_headers.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -103,6 +142,9 @@ impl Default for ConnectOptions {
             connection_timeout: Duration::from_secs(5),
             tls_required: false,
             tls_first: false,
+            tls_optional: false,
+            tls_server_name: None,
+            verify_discovered_servers_by_ip: false,
             certificates: Vec::new(),
             client_cert: None,
             client_key: None,
@@ -117,11 +159,14 @@ impl Default for ConnectOptions {
             ignore_discovered_servers: false,
             retain_servers_order: false,
             read_buffer_capacity: 65535,
-            reconnect_delay_callback: Box::new(|attempts| {
+            reconnect_delay_callback: Arc::new(|attempts| {
                 connector::reconnect_delay_callback_default(attempts)
             }),
             auth: Default::default(),
             auth_callback: None,
+            skip_subject_validation: false,
+            local_address: None,
+            reconnect_to_server_callback: None,
             auth_url_callback: None,
             handshake_headers: HashMap::new(),
         }
@@ -205,7 +250,7 @@ impl ConnectOptions {
         Fut: Future<Output = std::result::Result<Auth, AuthError>> + 'static + Send + Sync,
     {
         let mut options = ConnectOptions::new();
-        options.auth_callback = Some(CallbackArg1::<Vec<u8>, Result<Auth, AuthError>>(Box::new(
+        options.auth_callback = Some(CallbackArg1::<Vec<u8>, Result<Auth, AuthError>>(Arc::new(
             move |nonce| Box::pin(callback(nonce)),
         )));
         options
@@ -295,6 +340,8 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "nkeys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "nkeys")))]
     pub fn with_nkey(seed: String) -> Self {
         ConnectOptions::default().nkey(seed)
     }
@@ -315,6 +362,8 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "nkeys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "nkeys")))]
     pub fn nkey(mut self, seed: String) -> Self {
         self.auth.nkey = Some(seed);
         self
@@ -343,6 +392,8 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "nkeys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "nkeys")))]
     pub fn with_jwt<F, Fut>(jwt: String, sign_cb: F) -> Self
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
@@ -377,6 +428,8 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "nkeys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "nkeys")))]
     pub fn jwt<F, Fut>(mut self, jwt: String, sign_cb: F) -> Self
     where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
@@ -384,7 +437,7 @@ impl ConnectOptions {
     {
         let sign_cb = Arc::new(sign_cb);
 
-        let jwt_sign_callback = CallbackArg1(Box::new(move |nonce: String| {
+        let jwt_sign_callback = CallbackArg1(Arc::new(move |nonce: String| {
             let sign_cb = sign_cb.clone();
             Box::pin(async move {
                 let sig = sign_cb(nonce.as_bytes().to_vec())
@@ -414,6 +467,8 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "nkeys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "nkeys")))]
     pub async fn with_credentials_file(path: impl AsRef<Path>) -> io::Result<Self> {
         let cred_file_contents = crate::auth_utils::load_creds(path.as_ref()).await?;
         Self::with_credentials(&cred_file_contents)
@@ -435,6 +490,8 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "nkeys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "nkeys")))]
     pub async fn credentials_file(self, path: impl AsRef<Path>) -> io::Result<Self> {
         let cred_file_contents = crate::auth_utils::load_creds(path.as_ref()).await?;
         self.credentials(&cred_file_contents)
@@ -466,6 +523,8 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "nkeys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "nkeys")))]
     pub fn with_credentials(creds: &str) -> io::Result<Self> {
         ConnectOptions::default().credentials(creds)
     }
@@ -499,6 +558,8 @@ impl ConnectOptions {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(feature = "nkeys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "nkeys")))]
     pub fn credentials(self, creds: &str) -> io::Result<Self> {
         let (jwt, key_pair) = crate::auth_utils::parse_jwt_and_key_from_creds(creds)?;
         let key_pair = std::sync::Arc::new(key_pair);
@@ -510,6 +571,12 @@ impl ConnectOptions {
     }
 
     /// Loads root certificates by providing the path to them.
+    ///
+    /// Asks for TLS: every server is then connected to with TLS, as with
+    /// [`ConnectOptions::require_tls`].
+    ///
+    /// These roots replace the platform's: with root certificates given, the roots of the
+    /// `native-certs` feature are not loaded.
     ///
     /// # Examples
     /// ```no_run
@@ -529,6 +596,9 @@ impl ConnectOptions {
 
     /// Loads client certificate by providing the path to it.
     ///
+    /// Asks for TLS: every server is then connected to with TLS, as with
+    /// [`ConnectOptions::require_tls`].
+    ///
     /// # Examples
     /// ```no_run
     /// # #[tokio::main]
@@ -546,7 +616,16 @@ impl ConnectOptions {
         self
     }
 
-    /// Sets or disables TLS requirement. If TLS connection is impossible while `options.require_tls(true)` connection will return error.
+    /// Requires TLS for every server when `true`. If TLS connection is impossible while `options.require_tls(true)` connection will return error.
+    ///
+    /// A `tls://` or `wss://` server URL, root certificates, a client certificate, a TLS client
+    /// config, [`ConnectOptions::tls_first`], [`ConnectOptions::tls_server_name`] and
+    /// [`ConnectOptions::verify_discovered_servers_by_ip`] ask for TLS too. TLS then applies to every
+    /// server in the list, servers discovered from the cluster and reconnects included, and
+    /// nothing the server sends turns it off.
+    ///
+    /// `false` is the default, and leaves the other settings asking for TLS. The opt-out
+    /// is [`ConnectOptions::tls_optional`].
     ///
     /// # Examples
     /// ```no_run
@@ -570,6 +649,88 @@ impl ConnectOptions {
     pub fn tls_first(mut self) -> ConnectOptions {
         self.tls_first = true;
         self.tls_required = true;
+        self
+    }
+
+    /// Leaves TLS to each server: the client does not ask for TLS, so root certificates, a
+    /// client certificate, a TLS client config, [`ConnectOptions::tls_server_name`],
+    /// [`ConnectOptions::verify_discovered_servers_by_ip`] or a `tls://` or `wss://` URL in
+    /// the list no longer make the other servers TLS. Each server is connected to as its own
+    /// URL says, or with TLS when its INFO requires it; a `tls://` or `wss://` URL still gets
+    /// TLS, and so does a server discovered on a connection with TLS.
+    ///
+    /// Cannot be set together with `require_tls(true)` or [`ConnectOptions::tls_first`].
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// let nc = async_nats::ConnectOptions::new()
+    ///     .add_root_certificates("mycerts.pem".into())
+    ///     .tls_optional()
+    ///     .connect(["nats://plain.nats.io", "tls://secure.nats.io"].as_slice())
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tls_optional(mut self) -> ConnectOptions {
+        self.tls_optional = true;
+        self
+    }
+
+    /// Sets the name the certificate of every server is verified against, and, unless it is
+    /// an IP address, that is sent as SNI: the configured servers and the servers discovered
+    /// from the cluster alike.
+    ///
+    /// It is the first remedy when a certificate is not valid for the name the client
+    /// verifies it against, for example for a server given by its IP address, and keeps
+    /// verification on.
+    ///
+    /// It overrides the name a discovered server inherits from the server it was learned
+    /// from, and [`ConnectOptions::verify_discovered_servers_by_ip`]. Asks for TLS: every
+    /// server is then connected to with TLS, as with [`ConnectOptions::require_tls`].
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// let nc = async_nats::ConnectOptions::new()
+    ///     .tls_server_name("nats.example.com")
+    ///     .connect("tls://10.0.0.1:4222")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tls_server_name<T: ToString>(mut self, name: T) -> ConnectOptions {
+        self.tls_server_name = Some(name.to_string());
+        self
+    }
+
+    /// Verifies a discovered server given as an IP address against that address instead of
+    /// the host name it was learned under, and sends it no SNI. It also lets the client
+    /// connect to a discovered IP address that has no name to be verified against, such as
+    /// one learned from a server given by its IP address.
+    ///
+    /// It is meant for clusters whose node certificates carry only IP addresses, and is safe
+    /// only where the CA that issued those certificates is not shared with others: any
+    /// certificate that CA issued for the address is accepted. It has no effect while
+    /// [`ConnectOptions::tls_server_name`] is set. Asks for TLS, as with
+    /// [`ConnectOptions::require_tls`].
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// let nc = async_nats::ConnectOptions::new()
+    ///     .add_root_certificates("cluster-ca.pem".into())
+    ///     .verify_discovered_servers_by_ip()
+    ///     .connect("tls://10.0.0.1:4222")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn verify_discovered_servers_by_ip(mut self) -> ConnectOptions {
+        self.verify_discovered_servers_by_ip = true;
         self
     }
 
@@ -631,8 +792,12 @@ impl ConnectOptions {
         self
     }
 
-    /// Sets a timeout for the underlying TcpStream connection to avoid hangs and deadlocks.
-    /// Default is set to 5 seconds.
+    /// Sets a timeout for the full connection establishment and handshake to avoid
+    /// hangs and deadlocks. This includes TCP/WebSocket connection, TLS setup,
+    /// waiting for the server INFO message, sending CONNECT/PING, and receiving
+    /// the initial server PONG response. On a connection that starts TLS after INFO, to
+    /// nats-server 2.12 or later, the client then waits up to this timeout once more for the
+    /// INFO that follows that PONG before it reports connected. Default is set to 5 seconds.
     ///
     /// # Examples
     /// ```no_run
@@ -650,7 +815,13 @@ impl ConnectOptions {
         self
     }
 
-    /// Sets a timeout for `Client::request`. Default value is set to 10 seconds.
+    /// Sets the timeout for `Client::request` and, when no JetStream context timeout is set,
+    /// for JetStream API requests. Default value is set to 10 seconds.
+    ///
+    /// `None` disables the timeout: a request whose reply is lost waits forever. On a JetStream
+    /// context without its own timeout this includes JetStream API requests; ordered consumer
+    /// recreation then falls back to 10 seconds. Avoid it. To wait longer on JetStream API
+    /// requests, set the JetStream context timeout instead.
     ///
     /// # Examples
     /// ```no_run
@@ -733,7 +904,7 @@ impl ConnectOptions {
         F: Fn(Event) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + 'static + Send + Sync,
     {
-        self.event_callback = Some(CallbackArg1::<Event, ()>(Box::new(move |event| {
+        self.event_callback = Some(CallbackArg1::<Event, ()>(Arc::new(move |event| {
             Box::pin(cb(event))
         })));
         self
@@ -759,15 +930,57 @@ impl ConnectOptions {
     where
         F: Fn(usize) -> Duration + Send + Sync + 'static,
     {
-        self.reconnect_delay_callback = Box::new(cb);
+        self.reconnect_delay_callback = Arc::new(cb);
         self
     }
 
-    /// By default, Client dispatches op's to the Client onto the channel with capacity of 128.
-    /// This option enables overriding it.
+    /// Sets a callback invoked on each reconnect attempt to select a specific
+    /// server from the pool.
+    ///
+    /// The callback receives a snapshot of available servers (with per-server
+    /// metadata such as reconnect count) and the last known [`ServerInfo`].
+    /// It should return a [`ReconnectToServer`] specifying which server to try
+    /// and how long to wait, or `None` to use default server selection.
+    ///
+    /// If the returned server address is not in the pool, the library falls back
+    /// to default selection and emits a [`ClientError`][crate::ClientError] event.
+    ///
+    /// When this callback returns `Some`, its delay takes precedence over
+    /// [`reconnect_delay_callback`][ConnectOptions::reconnect_delay_callback].
     ///
     /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// async_nats::ConnectOptions::new()
+    ///     .reconnect_to_server_callback(|servers, _info| async move {
+    ///         // Always try the first available server immediately.
+    ///         servers.first().map(|s| async_nats::ReconnectToServer {
+    ///             addr: s.addr.clone(),
+    ///             delay: Some(std::time::Duration::ZERO),
+    ///         })
+    ///     })
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
     /// ```
+    pub fn reconnect_to_server_callback<F, Fut>(mut self, cb: F) -> ConnectOptions
+    where
+        F: Fn(Vec<Server>, ServerInfo) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<ReconnectToServer>> + Send + Sync + 'static,
+    {
+        self.reconnect_to_server_callback = Some(CallbackArg1(Arc::new(move |(servers, info)| {
+            Box::pin(cb(servers, info))
+        })));
+        self
+    }
+
+    /// By default, Client dispatches commands onto a client channel with capacity `2048`.
+    /// This option lets you override that capacity.
+    ///
+    /// # Examples
+    /// ```no_run
     /// # #[tokio::main]
     /// # async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     /// async_nats::ConnectOptions::new()
@@ -854,9 +1067,39 @@ impl ConnectOptions {
         self
     }
 
+    /// Disables subject validation for publish operations.
+    ///
+    /// By default, the client validates publish subjects to ensure they don't contain
+    /// whitespace characters (space, tab, CR, LF).
+    ///
+    /// This option only affects **publish** validation. Subscribe and queue group
+    /// validation always runs regardless of this setting, matching the behavior
+    /// of the Go and Java NATS clients.
+    ///
+    /// # Warning
+    /// Using invalid subjects may cause protocol errors with the NATS server.
+    /// Only disable validation if you are certain all published subjects are valid.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// async_nats::ConnectOptions::new()
+    ///     .skip_subject_validation(true)
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn skip_subject_validation(mut self, skip: bool) -> ConnectOptions {
+        self.skip_subject_validation = skip;
+        self
+    }
+
     /// By default, a server may advertise other servers in the cluster known to it.
     /// By setting this option, the client will ignore the advertised servers.
     /// This may be useful if the client may not be able to reach them.
+    /// The client then also does not wait for the INFO that follows the first PONG.
     pub fn ignore_discovered_servers(mut self) -> ConnectOptions {
         self.ignore_discovered_servers = true;
         self
@@ -872,13 +1115,21 @@ impl ConnectOptions {
 
     /// Allows passing custom rustls tls config.
     ///
+    /// Asks for TLS: every server is then connected to with TLS, as with
+    /// [`ConnectOptions::require_tls`].
+    ///
+    /// The config verifies servers on its own: neither the platform's roots of the
+    /// `native-certs` feature nor the roots of [`ConnectOptions::add_root_certificates`] are
+    /// added to it. The example below builds it from the platform's roots, with the
+    /// rustls-native-certs crate.
+    ///
     /// # Examples
     /// ```
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), async_nats::Error> {
     /// let mut root_store = async_nats::rustls::RootCertStore::empty();
     ///
-    /// root_store.add_parsable_certificates(rustls_native_certs::load_native_certs()?);
+    /// root_store.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
     ///
     /// let tls_client = async_nats::rustls::ClientConfig::builder()
     ///     .with_root_certificates(root_store)
@@ -917,45 +1168,76 @@ impl ConnectOptions {
         self
     }
 
-    /// Creates a builder with a custom auth url callback to be called when a 401 error is encountered during handshake.
-    /// The callback should return a new connection string to use for reconnection.
-    /// If the callback fails, the standard reconnect mechanism will be used.
+    /// Sets the local socket address that the client will bind to when connecting
+    /// to the server. This is useful when the client machine has multiple
+    /// network interfaces and you want to control which one is used, or when
+    /// you need to bind to a specific local port.
     ///
-    /// # Example
+    /// Use port `0` to let the operating system assign an ephemeral port.
+    ///
+    /// # Examples
     /// ```no_run
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// // Bind to a specific IP with an OS-assigned port
+    /// let addr: std::net::SocketAddr = "192.168.1.10:0".parse().unwrap();
     /// async_nats::ConnectOptions::new()
-    ///     .auth_url_callback(|| async move {
-    ///         // Get new connection URL from your auth service
-    ///         Ok("nats://new-server:4222".to_string())
-    ///     })
+    ///     .local_address(addr)
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    ///
+    /// // Bind to a specific IP and port
+    /// let addr: std::net::SocketAddr = "192.168.1.10:9898".parse().unwrap();
+    /// async_nats::ConnectOptions::new()
+    ///     .local_address(addr)
     ///     .connect("demo.nats.io")
     ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn auth_url_callback<F, Fut>(mut self, callback: F) -> Self
+    pub fn local_address(mut self, address: SocketAddr) -> ConnectOptions {
+        self.local_address = Some(address);
+        self
+    }
+
+    /// Sets a callback that returns a new server URL when a server rejects the credentials
+    /// (an authorization violation in the NATS handshake, or HTTP 401 on the WebSocket upgrade).
+    /// The client then connects to that URL only; if the callback fails, it retries as before.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// async_nats::ConnectOptions::new()
+    ///     .retry_on_initial_connect()
+    ///     .auth_url_callback(|()| async move {
+    ///         // Get a URL with fresh credentials from your auth service.
+    ///         Ok("wss://nats.example.com/ws?authorization=new-token".to_string())
+    ///     })
+    ///     .connect("wss://nats.example.com/ws?authorization=old-token")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn auth_url_callback<F, Fut>(mut self, callback: F) -> ConnectOptions
     where
         F: Fn(()) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = std::result::Result<String, AuthError>> + 'static + Send + Sync,
     {
-        self.auth_url_callback = Some(CallbackArg1::<(), Result<String, AuthError>>(Box::new(
-            move |()| Box::pin(callback(())),
-        )));
+        self.auth_url_callback = Some(CallbackArg1(Arc::new(move |()| Box::pin(callback(())))));
         self
     }
 
-    /// Adds a custom HTTP header to be sent during WebSocket handshake.
-    /// This is only used when connecting via WebSocket (`ws://` or `wss://` schemes).
+    /// Adds an HTTP header to the WebSocket upgrade request of `ws://` and `wss://`
+    /// connections. A header that is not a valid HTTP header, or one the WebSocket handshake
+    /// sets itself, is skipped with a warning.
     ///
-    /// # Example
+    /// # Examples
     /// ```no_run
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), async_nats::ConnectError> {
     /// async_nats::ConnectOptions::new()
     ///     .custom_header("x-machine-id", "my-machine-123")
-    ///     .custom_header("x-tenant-id", "tenant-456")
     ///     .connect("ws://demo.nats.io")
     ///     .await?;
     /// # Ok(())
@@ -966,14 +1248,16 @@ impl ConnectOptions {
         K: ToString,
         V: ToString,
     {
-        self.handshake_headers.insert(name.to_string(), value.to_string());
+        self.handshake_headers
+            .insert(name.to_string(), value.to_string());
         self
     }
 }
 
 pub(crate) type AsyncCallbackArg1<A, T> =
-    Box<dyn Fn(A) -> Pin<Box<dyn Future<Output = T> + Send + Sync + 'static>> + Send + Sync>;
+    Arc<dyn Fn(A) -> Pin<Box<dyn Future<Output = T> + Send + Sync + 'static>> + Send + Sync>;
 
+#[derive(Clone)]
 pub(crate) struct CallbackArg1<A, T>(AsyncCallbackArg1<A, T>);
 
 impl<A, T> CallbackArg1<A, T> {
@@ -1001,13 +1285,13 @@ impl AuthError {
 
 impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(&format!("AuthError({})", &self.0))
+        f.write_str(&format!("AuthError({})", self.0))
     }
 }
 
 impl std::fmt::Debug for AuthError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(&format!("AuthError({})", &self.0))
+        f.write_str(&format!("AuthError({})", self.0))
     }
 }
 

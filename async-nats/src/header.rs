@@ -23,7 +23,7 @@
 use std::{collections::HashMap, fmt, slice::Iter, str::FromStr};
 
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A struct for handling NATS headers.
 /// Has a similar API to `http::header`, but properly serializes and deserializes
@@ -44,9 +44,48 @@ use serde::{Deserialize, Serialize};
 /// # }
 /// ```
 
-#[derive(Clone, PartialEq, Eq, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct HeaderMap {
     inner: HashMap<HeaderName, Vec<HeaderValue>>,
+}
+
+/// Helper enum for backward-compatible deserialization using serde's untagged feature
+/// This is required because of the bug #1470 where the client incorrectly serialized
+/// headers with an "inner" wrapper.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HeaderMapHelper {
+    // Legacy format with "inner" wrapper
+    Legacy {
+        inner: HashMap<HeaderName, Vec<HeaderValue>>,
+    },
+    // Proper format - direct HashMap
+    Current(HashMap<HeaderName, Vec<HeaderValue>>),
+}
+
+impl<'de> Deserialize<'de> for HeaderMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Use the untagged enum to automatically try both formats
+        let helper = HeaderMapHelper::deserialize(deserializer)?;
+
+        Ok(match helper {
+            HeaderMapHelper::Legacy { inner } => HeaderMap { inner },
+            HeaderMapHelper::Current(inner) => HeaderMap { inner },
+        })
+    }
+}
+
+impl Serialize for HeaderMap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Serialize as the new format (direct HashMap without "inner" wrapper)
+        self.inner.serialize(serializer)
+    }
 }
 
 impl FromIterator<(HeaderName, HeaderValue)> for HeaderMap {
@@ -114,10 +153,26 @@ impl HeaderMap {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+
+    /// Serialized byte length of this header block (as [`HeaderMap::to_bytes`]
+    /// produces), computed without allocating.
+    pub(crate) fn wire_len(&self) -> usize {
+        // Mirrors `to_bytes`: "NATS/1.0\r\n" + each "<key>: <value>\r\n" + "\r\n".
+        let mut len = b"NATS/1.0\r\n".len() + b"\r\n".len();
+        for (k, vs) in &self.inner {
+            for v in vs.iter() {
+                len += k.as_str().len() + b": ".len() + v.inner.len() + b"\r\n".len();
+            }
+        }
+        len
+    }
 }
 
 impl HeaderMap {
     /// Inserts a new value to a [HeaderMap].
+    ///
+    /// A string value has each `\r` and `\n` replaced with a space, see
+    /// [`HeaderValue::from_lossy`].
     ///
     /// # Examples
     ///
@@ -134,6 +189,9 @@ impl HeaderMap {
 
     /// Appends a new value to the list of values to a given key.
     /// If the key did not exist, it will be inserted with provided value.
+    ///
+    /// A string value has each `\r` and `\n` replaced with a space, see
+    /// [`HeaderValue::from_lossy`].
     ///
     /// # Examples
     ///
@@ -232,6 +290,10 @@ impl HeaderMap {
 
 /// Represents NATS header field value.
 ///
+/// A header value cannot span lines. [`HeaderMap::insert`], [`HeaderMap::append`] and
+/// [`HeaderValue::from_lossy`] replace each `\r` and `\n` in a string with a space, while
+/// [`HeaderValue::try_from`] and [`str::parse`] refuse a string holding them.
+///
 /// # Examples
 ///
 /// ```
@@ -242,6 +304,7 @@ impl HeaderMap {
 /// headers.insert("Another", "AnotherValue");
 /// ```
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct HeaderValue {
     inner: String,
 }
@@ -332,27 +395,39 @@ impl FromStr for HeaderValue {
     type Err = ParseHeaderValueError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.contains(['\r', '\n']) {
-            return Err(ParseHeaderValueError);
-        }
-
+        validate_header_value(s)?;
         Ok(HeaderValue {
             inner: s.to_string(),
         })
     }
 }
 
-impl From<&str> for HeaderValue {
-    fn from(v: &str) -> Self {
-        Self {
-            inner: v.to_string(),
-        }
+/// Fallible conversion from a borrowed string slice; refuses a value holding `\r` or `\n`.
+impl TryFrom<&str> for HeaderValue {
+    type Error = ParseHeaderValueError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
     }
 }
 
-impl From<String> for HeaderValue {
-    fn from(inner: String) -> Self {
-        Self { inner }
+/// Fallible conversion from a borrowed `String`; refuses a value holding `\r` or `\n`.
+impl TryFrom<&String> for HeaderValue {
+    type Error = ParseHeaderValueError;
+
+    fn try_from(value: &String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+/// Fallible conversion from an owned `String`; refuses a value holding `\r` or `\n` and
+/// reuses the string's allocation otherwise.
+impl TryFrom<String> for HeaderValue {
+    type Error = ParseHeaderValueError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_header_value(&value)?;
+        Ok(Self { inner: value })
     }
 }
 
@@ -361,12 +436,37 @@ impl HeaderValue {
         HeaderValue::default()
     }
 
+    /// Creates a header value, replacing each `\r` and `\n` with a space, as a header value
+    /// cannot hold them. Use [`HeaderValue::try_from`] or [`str::parse`] to refuse such a value
+    /// instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use async_nats::HeaderValue;
+    ///
+    /// let value = HeaderValue::from_lossy("first\nsecond");
+    /// assert_eq!(value.as_str(), "first second");
+    /// ```
+    pub fn from_lossy(value: &str) -> Self {
+        if value.contains(['\r', '\n']) {
+            Self {
+                inner: value.replace(['\r', '\n'], " "),
+            }
+        } else {
+            Self {
+                inner: value.to_string(),
+            }
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         self.inner.as_str()
     }
 }
 
-#[derive(Debug, Clone)]
+/// The error returned when a string cannot be a [`HeaderValue`] because it holds `\r` or `\n`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseHeaderValueError;
 
 impl fmt::Display for ParseHeaderValueError {
@@ -380,22 +480,48 @@ impl fmt::Display for ParseHeaderValueError {
 
 impl std::error::Error for ParseHeaderValueError {}
 
+fn validate_header_value(s: &str) -> Result<(), ParseHeaderValueError> {
+    if s.contains(['\r', '\n']) {
+        Err(ParseHeaderValueError)
+    } else {
+        Ok(())
+    }
+}
+
 pub trait IntoHeaderName {
     fn into_header_name(self) -> HeaderName;
 }
 
 impl IntoHeaderName for &str {
     fn into_header_name(self) -> HeaderName {
-        HeaderName {
-            inner: HeaderRepr::Custom(self.into()),
+        assert!(
+            validate_header_name(self).is_ok(),
+            "invalid header name: cannot contain control characters, non-ASCII, or ':'"
+        );
+        match StandardHeader::from_bytes(self.as_bytes()) {
+            Some(v) => HeaderName {
+                inner: HeaderRepr::Standard(v),
+            },
+            None => HeaderName {
+                inner: HeaderRepr::Custom(self.into()),
+            },
         }
     }
 }
 
 impl IntoHeaderName for String {
     fn into_header_name(self) -> HeaderName {
-        HeaderName {
-            inner: HeaderRepr::Custom(self.into()),
+        assert!(
+            validate_header_name(&self).is_ok(),
+            "invalid header name: cannot contain control characters, non-ASCII, or ':'"
+        );
+        match StandardHeader::from_bytes(self.as_bytes()) {
+            Some(v) => HeaderName {
+                inner: HeaderRepr::Standard(v),
+            },
+            None => HeaderName {
+                inner: HeaderRepr::Custom(self.into()),
+            },
         }
     }
 }
@@ -406,21 +532,25 @@ impl IntoHeaderName for HeaderName {
     }
 }
 
+/// Converts a value into a [`HeaderValue`]. Strings are converted with
+/// [`HeaderValue::from_lossy`], so each `\r` and `\n` becomes a space.
 pub trait IntoHeaderValue {
     fn into_header_value(self) -> HeaderValue;
 }
 
 impl IntoHeaderValue for &str {
     fn into_header_value(self) -> HeaderValue {
-        HeaderValue {
-            inner: self.to_string(),
-        }
+        HeaderValue::from_lossy(self)
     }
 }
 
 impl IntoHeaderValue for String {
     fn into_header_value(self) -> HeaderValue {
-        HeaderValue { inner: self }
+        if self.contains(['\r', '\n']) {
+            HeaderValue::from_lossy(&self)
+        } else {
+            HeaderValue { inner: self }
+        }
     }
 }
 
@@ -524,7 +654,58 @@ standard_headers! {
     (NatsMessageTtl, NATS_MESSAGE_TTL, b"Nats-TTL");
     /// Reason why the delete marked on a stream with enabled markers was put.
     (NatsMarkerReason, NATS_MARKER_REASON, b"Nats-Marker-Reason");
+    /// Initiates a rollup of the given subject(s); valid values are `sub` and `all`.
+    (NatsRollup, NATS_ROLLUP, b"Nats-Rollup");
+    /// Schedule expression for a JetStream message scheduler entry. ADR-51.
+    (NatsSchedule, NATS_SCHEDULE, b"Nats-Schedule");
+    /// Target subject the schedule publishes to.
+    (NatsScheduleTarget, NATS_SCHEDULE_TARGET, b"Nats-Schedule-Target");
+    /// TTL applied to messages produced by the schedule.
+    (NatsScheduleTtl, NATS_SCHEDULE_TTL, b"Nats-Schedule-TTL");
+    /// Source subject sampled into the schedule output.
+    (NatsScheduleSource, NATS_SCHEDULE_SOURCE, b"Nats-Schedule-Source");
+    /// Time zone for cron schedules. Accepts IANA names like `America/New_York`.
+    (NatsScheduleTimeZone, NATS_SCHEDULE_TIME_ZONE, b"Nats-Schedule-Time-Zone");
+    /// Auto-applies a rollup on the schedule target. Currently only `sub` is valid.
+    (NatsScheduleRollup, NATS_SCHEDULE_ROLLUP, b"Nats-Schedule-Rollup");
+    /// On schedule-produced messages: the subject of the originating schedule.
+    (NatsScheduler, NATS_SCHEDULER, b"Nats-Scheduler");
+    /// On schedule-produced messages: timestamp of next firing or `purge` for delayed schedules.
+    (NatsScheduleNext, NATS_SCHEDULE_NEXT, b"Nats-Schedule-Next");
+    /// Atomic batch publish: batch id (max 64 chars).
+    (NatsBatchId, NATS_BATCH_ID, b"Nats-Batch-Id");
+    /// Atomic batch publish: per-message sequence within the batch.
+    (NatsBatchSequence, NATS_BATCH_SEQUENCE, b"Nats-Batch-Sequence");
+    /// Atomic batch publish: commit marker. `1` to commit and store the final
+    /// message; `eob` to commit without storing it (end-of-batch).
+    (NatsBatchCommit, NATS_BATCH_COMMIT, b"Nats-Batch-Commit");
+    /// Minimum JetStream API level the publishing client requires; the server
+    /// will reject the message (and the enclosing batch, if any) when its own
+    /// level is below the value set here.
+    (NatsRequiredApiLevel, NATS_REQUIRED_API_LEVEL, b"Nats-Required-Api-Level");
+    /// Id of the pull client a pinned client priority consumer delivers to.
+    (NatsPinId, NATS_PIN_ID, b"Nats-Pin-Id");
 }
+
+/// Value constant for [`NATS_BATCH_COMMIT`]: commit and store the final message.
+pub const NATS_BATCH_COMMIT_FINAL: &str = "1";
+/// Value constant for [`NATS_BATCH_COMMIT`]: commit without storing the final
+/// message (end-of-batch). Server is case-sensitive on this string.
+pub const NATS_BATCH_COMMIT_EOB: &str = "eob";
+/// Value constant for [`NATS_SCHEDULE_ROLLUP`]: rollup the schedule's target
+/// subject. Currently the only legal value.
+pub const NATS_SCHEDULE_ROLLUP_SUB: &str = "sub";
+
+/// Predefined [`NATS_SCHEDULE`] expression: run once a year at midnight Jan 1.
+pub const NATS_SCHEDULE_YEARLY: &str = "@yearly";
+/// Predefined [`NATS_SCHEDULE`] expression: run once a month at midnight on the 1st.
+pub const NATS_SCHEDULE_MONTHLY: &str = "@monthly";
+/// Predefined [`NATS_SCHEDULE`] expression: run once a week at midnight Sat→Sun.
+pub const NATS_SCHEDULE_WEEKLY: &str = "@weekly";
+/// Predefined [`NATS_SCHEDULE`] expression: run once a day at midnight.
+pub const NATS_SCHEDULE_DAILY: &str = "@daily";
+/// Predefined [`NATS_SCHEDULE`] expression: run once an hour at the top of the hour.
+pub const NATS_SCHEDULE_HOURLY: &str = "@hourly";
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct CustomHeader {
@@ -612,18 +793,42 @@ impl FromStr for HeaderName {
     type Err = ParseHeaderNameError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.contains(|c: char| c == ':' || (c as u8) < 33 || (c as u8) > 126) {
-            return Err(ParseHeaderNameError);
-        }
-
-        match StandardHeader::from_bytes(s.as_ref()) {
-            Some(v) => Ok(HeaderName {
+        validate_header_name(s)?;
+        Ok(match StandardHeader::from_bytes(s.as_bytes()) {
+            Some(v) => HeaderName {
                 inner: HeaderRepr::Standard(v),
-            }),
-            None => Ok(HeaderName {
+            },
+            None => HeaderName {
                 inner: HeaderRepr::Custom(CustomHeader::from(s)),
-            }),
-        }
+            },
+        })
+    }
+}
+
+/// Fallible conversion from a borrowed string slice; validates the name without panicking.
+impl TryFrom<&str> for HeaderName {
+    type Error = ParseHeaderNameError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+/// Fallible conversion from an owned `String`; validates without panicking and
+/// avoids re-allocating the bytes when the result is a custom (non-standard) name.
+impl TryFrom<String> for HeaderName {
+    type Error = ParseHeaderNameError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_header_name(&value)?;
+        Ok(match StandardHeader::from_bytes(value.as_bytes()) {
+            Some(v) => HeaderName {
+                inner: HeaderRepr::Standard(v),
+            },
+            None => HeaderName {
+                inner: HeaderRepr::Custom(CustomHeader::from(value)),
+            },
+        })
     }
 }
 
@@ -665,7 +870,9 @@ impl<'de> Deserialize<'de> for HeaderName {
     }
 }
 
-#[derive(Debug, Clone)]
+/// The error returned when a string cannot be a [`HeaderName`] because it holds a character
+/// other than visible ASCII, or a `:`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseHeaderNameError;
 
 impl std::fmt::Display for ParseHeaderNameError {
@@ -676,9 +883,20 @@ impl std::fmt::Display for ParseHeaderNameError {
 
 impl std::error::Error for ParseHeaderNameError {}
 
+fn validate_header_name(s: &str) -> Result<(), ParseHeaderNameError> {
+    if s.contains(|c: char| !c.is_ascii_graphic() || c == ':') {
+        Err(ParseHeaderNameError)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HeaderMap, HeaderName, HeaderValue, IntoHeaderName, IntoHeaderValue};
+    use super::{
+        HeaderMap, HeaderName, HeaderValue, IntoHeaderName, IntoHeaderValue, ParseHeaderNameError,
+        ParseHeaderValueError,
+    };
     use std::str::{from_utf8, FromStr};
 
     #[test]
@@ -753,6 +971,19 @@ mod tests {
         let bytes = headers.to_bytes();
 
         println!("bytes: {:?}", from_utf8(&bytes));
+    }
+
+    #[test]
+    fn wire_len_matches_serialized() {
+        let mut headers = HeaderMap::new();
+        headers.append("Key", "value");
+        headers.append("Key", "second_value");
+        headers.insert("Second", "SecondValue");
+        assert_eq!(headers.wire_len(), headers.to_bytes().len());
+
+        // An empty block still serializes the framing bytes.
+        let empty = HeaderMap::new();
+        assert_eq!(empty.wire_len(), empty.to_bytes().len());
     }
 
     #[test]
@@ -861,11 +1092,266 @@ mod tests {
     }
 
     #[test]
-    fn header_value_from_string() {
+    fn header_value_try_from_string() {
         let string = "some value".to_string();
 
-        let value: HeaderValue = string.into();
+        let value = HeaderValue::try_from(string).unwrap();
 
         assert_eq!("some value", value.as_str());
+    }
+
+    #[test]
+    fn header_map_backward_compatible_deserialization() {
+        // Test new format (direct HashMap) - this is how it should serialize now
+        let new_format_json =
+            r#"{"Content-Type": ["application/json"], "Authorization": ["Bearer token"]}"#;
+        let header_map: HeaderMap = serde_json::from_str(new_format_json).unwrap();
+
+        assert_eq!(
+            header_map.get("Content-Type").unwrap().as_str(),
+            "application/json"
+        );
+        assert_eq!(
+            header_map.get("Authorization").unwrap().as_str(),
+            "Bearer token"
+        );
+
+        // Test legacy format (with "inner" wrapper) - this is the old format that should still work
+        let legacy_format_json = r#"{"inner": {"Content-Type": ["application/json"], "Authorization": ["Bearer token"]}}"#;
+        let header_map_legacy: HeaderMap = serde_json::from_str(legacy_format_json).unwrap();
+
+        assert_eq!(
+            header_map_legacy.get("Content-Type").unwrap().as_str(),
+            "application/json"
+        );
+        assert_eq!(
+            header_map_legacy.get("Authorization").unwrap().as_str(),
+            "Bearer token"
+        );
+
+        // Both should be equal after deserialization
+        assert_eq!(header_map, header_map_legacy);
+    }
+
+    #[test]
+    fn header_map_serialization_new_format() {
+        // Test that serialization uses the new format (no "inner" wrapper)
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json");
+        headers.insert("Authorization", "Bearer token");
+
+        let serialized = serde_json::to_string(&headers).unwrap();
+
+        // Should not contain "inner" key
+        assert!(!serialized.contains("inner"));
+
+        // Should be able to deserialize back
+        let deserialized: HeaderMap = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(headers, deserialized);
+    }
+
+    #[test]
+    fn header_map_roundtrip_compatibility() {
+        // Test that we can roundtrip both formats
+        let mut original = HeaderMap::new();
+        original.insert("X-Custom-Header", "custom-value");
+        original.append("Multi-Value", "value1");
+        original.append("Multi-Value", "value2");
+
+        // Serialize using new format
+        let new_serialized = serde_json::to_string(&original).unwrap();
+        let new_deserialized: HeaderMap = serde_json::from_str(&new_serialized).unwrap();
+        assert_eq!(original, new_deserialized);
+
+        // Manually create legacy format JSON
+        let legacy_json = format!(r#"{{"inner": {}}}"#, new_serialized);
+        let legacy_deserialized: HeaderMap = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(original, legacy_deserialized);
+    }
+
+    #[test]
+    fn header_map_invalid_format_error() {
+        // Test that invalid JSON returns proper error
+        let invalid_json = r#"{"not_inner_or_direct": {"Content-Type": ["application/json"]}}"#;
+        let result = serde_json::from_str::<HeaderMap>(invalid_json);
+        assert!(result.is_err());
+
+        let error_message = result.unwrap_err().to_string();
+        // With untagged enum, serde will report that data doesn't match any variant
+        assert!(error_message.contains("did not match any variant"));
+    }
+
+    #[test]
+    fn header_map_empty_cases() {
+        // Test empty HeaderMap serialization/deserialization
+        let empty = HeaderMap::new();
+        let serialized = serde_json::to_string(&empty).unwrap();
+        assert_eq!(serialized, "{}");
+
+        let deserialized: HeaderMap = serde_json::from_str("{}").unwrap();
+        assert!(deserialized.is_empty());
+
+        // Test legacy empty format
+        let legacy_empty = r#"{"inner": {}}"#;
+        let legacy_deserialized: HeaderMap = serde_json::from_str(legacy_empty).unwrap();
+        assert!(legacy_deserialized.is_empty());
+    }
+
+    #[test]
+    fn header_map_mixed_legacy_detection() {
+        // Test that an "inner" header name doesn't confuse the deserializer
+        // This would be a new format where "inner" is a legitimate header name
+        let json_with_inner_header =
+            r#"{"inner": ["some-value"], "Other-Header": ["other-value"]}"#;
+        let header_map: HeaderMap = serde_json::from_str(json_with_inner_header).unwrap();
+
+        // Should have two headers
+        assert_eq!(header_map.len(), 2);
+        assert_eq!(header_map.get("inner").unwrap().as_str(), "some-value");
+        assert_eq!(
+            header_map.get("Other-Header").unwrap().as_str(),
+            "other-value"
+        );
+    }
+
+    #[test]
+    fn header_map_insert_replaces_line_breaks() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Key", "value\r\nPUB attack 0\r\n\r\n");
+        headers.append("Other", "a\rb\nc".to_string());
+
+        assert_eq!(
+            headers.get("Key").unwrap().as_str(),
+            "value  PUB attack 0    "
+        );
+        assert_eq!(headers.get("Other").unwrap().as_str(), "a b c");
+    }
+
+    #[test]
+    fn header_value_from_lossy_replaces_line_breaks() {
+        assert_eq!(HeaderValue::from_lossy("a\r\nb").as_str(), "a  b");
+        assert_eq!(HeaderValue::from_lossy("plain").as_str(), "plain");
+    }
+
+    #[test]
+    fn header_value_try_from_rejects_line_breaks() {
+        assert!(HeaderValue::try_from("value\rwith\rcr").is_err());
+        assert!(HeaderValue::try_from("value\nwith\nlf").is_err());
+        assert!(HeaderValue::try_from("injected\r\nPUB attack 0\r\n\r\n".to_string()).is_err());
+        assert_eq!(HeaderValue::try_from("value").unwrap().as_str(), "value");
+        assert_eq!(
+            HeaderValue::try_from("value".to_string()).unwrap().as_str(),
+            "value"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header name")]
+    fn header_name_into_trait_rejects_cr() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Bad\rName", "value");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header name")]
+    fn header_name_into_trait_rejects_lf() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Bad\nName", "value");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header name")]
+    fn header_name_into_trait_rejects_space() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Bad Name", "value");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header name")]
+    fn header_name_into_trait_rejects_colon() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Bad:Name", "value");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header name")]
+    fn header_name_from_string_rejects_control_chars() {
+        let name = "Bad\x00Name".to_string();
+        name.into_header_name();
+    }
+
+    #[test]
+    fn header_value_try_from_string_ref() {
+        let value = String::from("value");
+        assert_eq!(HeaderValue::try_from(&value).unwrap().as_str(), "value");
+        assert!(HeaderValue::try_from(&String::from("a\nb")).is_err());
+    }
+
+    #[test]
+    fn parse_errors_are_comparable() {
+        assert_eq!(HeaderValue::try_from("a\nb"), Err(ParseHeaderValueError));
+        assert_eq!(HeaderName::try_from("Bad Name"), Err(ParseHeaderNameError));
+    }
+
+    #[test]
+    fn valid_header_values_still_work() {
+        HeaderValue::try_from("normal value").unwrap();
+        HeaderValue::try_from("value with special chars !@#$%^&*()").unwrap();
+        HeaderValue::try_from("").unwrap();
+        HeaderValue::try_from(String::from("string value")).unwrap();
+    }
+
+    #[test]
+    fn header_name_try_from_str() {
+        assert_eq!(
+            HeaderName::try_from("X-Custom").unwrap().as_str(),
+            "X-Custom"
+        );
+        assert!(HeaderName::try_from("Bad Name").is_err());
+        assert!(HeaderName::try_from("Bad:Name").is_err());
+    }
+
+    #[test]
+    fn header_name_try_from_string() {
+        assert_eq!(
+            HeaderName::try_from("Nats-Stream".to_string())
+                .unwrap()
+                .as_str(),
+            "Nats-Stream"
+        );
+        assert!(HeaderName::try_from("Bad\nName".to_string()).is_err());
+    }
+
+    #[test]
+    fn valid_header_names_still_work() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Custom-Header", "value");
+        headers.insert("Another-Header", "value");
+        headers.insert("$dollar", "value");
+        headers.insert("Nats-Stream", "value");
+        assert_eq!(headers.get("Nats-Stream").unwrap().as_str(), "value");
+    }
+
+    #[test]
+    fn header_map_large_headers() {
+        // Test with many headers
+        let mut headers = HeaderMap::new();
+        for i in 0..100 {
+            headers.insert(format!("Header-{}", i), format!("Value-{}", i));
+        }
+
+        let serialized = serde_json::to_string(&headers).unwrap();
+        let deserialized: HeaderMap = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(headers.len(), deserialized.len());
+        for i in 0..100 {
+            assert_eq!(
+                deserialized
+                    .get(format!("Header-{}", i).as_str())
+                    .unwrap()
+                    .as_str(),
+                format!("Value-{}", i)
+            );
+        }
     }
 }
