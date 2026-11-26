@@ -16,17 +16,16 @@ use core::task::{Context, Poll};
 use std::future::Future;
 
 use crate::connection::State;
+use crate::message::OutboundMessage;
 use crate::subject::ToSubject;
-use crate::{PublishMessage, ServerInfo};
+use crate::ServerInfo;
 
 use super::{header::HeaderMap, status::StatusCode, Command, Message, Subscriber};
 use crate::error::Error;
 use bytes::Bytes;
 use futures_util::future::TryFutureExt;
 use futures_util::{Sink, SinkExt as _, StreamExt};
-use once_cell::sync::Lazy;
 use portable_atomic::AtomicU64;
-use regex::Regex;
 use std::fmt::Display;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -34,10 +33,15 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::PollSender;
-use tracing::trace;
 
-static VERSION_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\Av?([0-9]+)\.?([0-9]+)?\.?([0-9]+)?").unwrap());
+/// Whether the server version `version` is at least `major.minor.patch`. The version comes
+/// from the server: one the connector cannot parse counts as not compatible.
+fn server_version_at_least(version: &str, major: i64, minor: i64, patch: i64) -> bool {
+    crate::connector::parse_server_version(version).is_some_and(|(a, b, c)| {
+        (i128::from(a), i128::from(b), i128::from(c))
+            >= (i128::from(major), i128::from(minor), i128::from(patch))
+    })
+}
 
 /// An error returned from the [`Client::publish`], [`Client::publish_with_headers`],
 /// [`Client::publish_with_reply`] or [`Client::publish_with_reply_and_headers`] functions.
@@ -58,7 +62,7 @@ impl From<tokio_util::sync::PollSendError<Command>> for PublishError {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PublishErrorKind {
     MaxPayloadExceeded,
-    BadSubject,
+    InvalidSubject,
     Send,
 }
 
@@ -67,9 +71,22 @@ impl Display for PublishErrorKind {
         match self {
             PublishErrorKind::MaxPayloadExceeded => write!(f, "max payload size exceeded"),
             PublishErrorKind::Send => write!(f, "failed to send message"),
-            PublishErrorKind::BadSubject => write!(f, "bad subject"),
+            PublishErrorKind::InvalidSubject => write!(f, "invalid subject"),
         }
     }
+}
+
+/// Shared error text for the max-payload errors, from `(max_payload, size)`.
+pub(crate) fn max_payload_message((max_payload, size): (usize, usize)) -> String {
+    format!("Payload size limit of {max_payload} exceeded by message size of {size}")
+}
+
+/// `map_err` helper turning a size violation into a [`PublishError`].
+fn max_payload_error(sizes: (usize, usize)) -> PublishError {
+    PublishError::with_source(
+        PublishErrorKind::MaxPayloadExceeded,
+        max_payload_message(sizes),
+    )
 }
 
 /// Client is a `Cloneable` handle to NATS connection.
@@ -77,7 +94,7 @@ impl Display for PublishErrorKind {
 /// [crate::connect] and [crate::ConnectOptions::connect]
 #[derive(Clone, Debug)]
 pub struct Client {
-    info: tokio::sync::watch::Receiver<ServerInfo>,
+    info: tokio::sync::watch::Receiver<Option<ServerInfo>>,
     pub(crate) state: tokio::sync::watch::Receiver<State>,
     pub(crate) sender: mpsc::Sender<Command>,
     poll_sender: PollSender<Command>,
@@ -87,6 +104,7 @@ pub struct Client {
     request_timeout: Option<Duration>,
     max_payload: Arc<AtomicUsize>,
     connection_stats: Arc<Statistics>,
+    skip_subject_validation: bool,
 }
 
 pub mod traits {
@@ -94,30 +112,42 @@ pub mod traits {
 
     use bytes::Bytes;
 
-    use crate::{subject::ToSubject, Message};
+    use crate::{message, subject::ToSubject, Message};
 
     use super::{PublishError, Request, RequestError, SubscribeError};
 
     pub trait Publisher {
-        fn publish_with_reply<S: ToSubject, R: ToSubject>(
+        fn publish_with_reply<S, R>(
             &self,
             subject: S,
             reply: R,
             payload: Bytes,
+        ) -> impl Future<Output = Result<(), PublishError>>
+        where
+            S: ToSubject,
+            R: ToSubject;
+
+        fn publish_message(
+            &self,
+            msg: message::OutboundMessage,
         ) -> impl Future<Output = Result<(), PublishError>>;
     }
     pub trait Subscriber {
-        fn subscribe<S: ToSubject>(
+        fn subscribe<S>(
             &self,
             subject: S,
-        ) -> impl Future<Output = Result<crate::Subscriber, SubscribeError>>;
+        ) -> impl Future<Output = Result<crate::Subscriber, SubscribeError>>
+        where
+            S: ToSubject;
     }
     pub trait Requester {
-        fn send_request<S: ToSubject>(
+        fn send_request<S>(
             &self,
             subject: S,
             request: Request,
-        ) -> impl Future<Output = Result<Message, RequestError>>;
+        ) -> impl Future<Output = Result<Message, RequestError>>
+        where
+            S: ToSubject;
     }
     pub trait TimeoutProvider {
         fn timeout(&self) -> Option<Duration>;
@@ -141,33 +171,56 @@ impl traits::TimeoutProvider for Client {
 }
 
 impl traits::Publisher for Client {
-    fn publish_with_reply<S: ToSubject, R: ToSubject>(
+    fn publish_with_reply<S, R>(
         &self,
         subject: S,
         reply: R,
         payload: Bytes,
-    ) -> impl Future<Output = Result<(), PublishError>> {
+    ) -> impl Future<Output = Result<(), PublishError>>
+    where
+        S: ToSubject,
+        R: ToSubject,
+    {
         self.publish_with_reply(subject, reply, payload)
+    }
+
+    async fn publish_message(&self, msg: OutboundMessage) -> Result<(), PublishError> {
+        if msg.subject.is_empty()
+            || (!self.skip_subject_validation && !crate::is_valid_publish_subject(&msg.subject))
+        {
+            return Err(PublishError::with_source(
+                PublishErrorKind::InvalidSubject,
+                crate::subject::SubjectError::InvalidFormat,
+            ));
+        }
+        self.check_payload_size(msg.headers.as_ref(), msg.payload.len())
+            .map_err(max_payload_error)?;
+        self.sender
+            .send(Command::Publish(msg))
+            .await
+            .map_err(Into::into)
     }
 }
 
 impl traits::Subscriber for Client {
-    fn subscribe<S: ToSubject>(
-        &self,
-        subject: S,
-    ) -> impl Future<Output = Result<Subscriber, SubscribeError>> {
+    fn subscribe<S>(&self, subject: S) -> impl Future<Output = Result<Subscriber, SubscribeError>>
+    where
+        S: ToSubject,
+    {
         self.subscribe(subject)
     }
 }
 
-impl Sink<PublishMessage> for Client {
+impl Sink<OutboundMessage> for Client {
     type Error = PublishError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.poll_sender.poll_ready_unpin(cx).map_err(Into::into)
     }
 
-    fn start_send(mut self: Pin<&mut Self>, msg: PublishMessage) -> Result<(), Self::Error> {
+    fn start_send(mut self: Pin<&mut Self>, msg: OutboundMessage) -> Result<(), Self::Error> {
+        self.check_payload_size(msg.headers.as_ref(), msg.payload.len())
+            .map_err(max_payload_error)?;
         self.poll_sender
             .start_send_unpin(Command::Publish(msg))
             .map_err(Into::into)
@@ -185,7 +238,7 @@ impl Sink<PublishMessage> for Client {
 impl Client {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        info: tokio::sync::watch::Receiver<ServerInfo>,
+        info: tokio::sync::watch::Receiver<Option<ServerInfo>>,
         state: tokio::sync::watch::Receiver<State>,
         sender: mpsc::Sender<Command>,
         capacity: usize,
@@ -193,6 +246,7 @@ impl Client {
         request_timeout: Option<Duration>,
         max_payload: Arc<AtomicUsize>,
         statistics: Arc<Statistics>,
+        skip_subject_validation: bool,
     ) -> Client {
         let poll_sender = PollSender::new(sender.clone());
         Client {
@@ -206,7 +260,36 @@ impl Client {
             request_timeout,
             max_payload,
             connection_stats: statistics,
+            skip_subject_validation,
         }
+    }
+
+    /// Validates a subject for publishing (protocol-framing safety only).
+    /// Checks for empty and whitespace. Does not check dot structure.
+    pub(crate) fn maybe_validate_publish_subject<S: ToSubject>(
+        &self,
+        subject: S,
+    ) -> Result<crate::Subject, crate::subject::SubjectError> {
+        let subject = subject.to_subject();
+        if subject.is_empty()
+            || (!self.skip_subject_validation && !crate::is_valid_publish_subject(&subject))
+        {
+            return Err(crate::subject::SubjectError::InvalidFormat);
+        }
+        Ok(subject)
+    }
+
+    /// Validates a subject for subscribing (protocol-framing + dot structure).
+    /// Always runs regardless of `skip_subject_validation` (matches Go/Java behavior).
+    pub(crate) fn validate_subscribe_subject<S: ToSubject>(
+        &self,
+        subject: S,
+    ) -> Result<crate::Subject, crate::subject::SubjectError> {
+        let subject = subject.to_subject();
+        if !subject.is_valid() {
+            return Err(crate::subject::SubjectError::InvalidFormat);
+        }
+        Ok(subject)
     }
 
     /// Returns the default timeout for requests set when creating the client.
@@ -224,6 +307,30 @@ impl Client {
         self.request_timeout
     }
 
+    /// Returns the last received info from the server if one has been observed.
+    ///
+    /// This is useful when [`ConnectOptions::retry_on_initial_connect`][crate::ConnectOptions::retry_on_initial_connect]
+    /// is enabled and the client is returned before the first server `INFO`
+    /// message arrives.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main () -> Result<(), async_nats::Error> {
+    /// let client = async_nats::ConnectOptions::new()
+    ///     .retry_on_initial_connect()
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    /// println!("info available: {}", client.try_server_info().is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_server_info(&self) -> Option<ServerInfo> {
+        // We ignore notifying the watcher, as that requires mutable client reference.
+        self.info.borrow().clone()
+    }
+
     /// Returns last received info from the server.
     ///
     /// # Examples
@@ -237,8 +344,46 @@ impl Client {
     /// # }
     /// ```
     pub fn server_info(&self) -> ServerInfo {
-        // We ignore notifying the watcher, as that requires mutable client reference.
-        self.info.borrow().to_owned()
+        self.try_server_info().unwrap_or_default()
+    }
+
+    /// Returns the maximum payload size currently used by the client.
+    ///
+    /// Before the first server `INFO` message arrives, this returns the default
+    /// server payload limit used for client-side publish validation.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main () -> Result<(), async_nats::Error> {
+    /// let client = async_nats::connect("demo.nats.io").await?;
+    /// println!("max payload: {:?}", client.max_payload());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn max_payload(&self) -> usize {
+        self.max_payload.load(Ordering::Relaxed)
+    }
+
+    /// Checks the wire size (serialized headers + payload, matching the server's
+    /// `HPUB` total) against the negotiated `max_payload`. On violation returns
+    /// `(max_payload, size)` for the caller to wrap in its own error.
+    pub(crate) fn check_payload_size(
+        &self,
+        headers: Option<&HeaderMap>,
+        payload_len: usize,
+    ) -> Result<(), (usize, usize)> {
+        let max_payload = self.max_payload.load(Ordering::Relaxed);
+        let size = match headers {
+            Some(headers) if !headers.is_empty() => headers.wire_len() + payload_len,
+            _ => payload_len,
+        };
+        if size > max_payload {
+            Err((max_payload, size))
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns true if the server version is compatible with the version components.
@@ -260,36 +405,15 @@ impl Client {
     pub fn is_server_compatible(&self, major: i64, minor: i64, patch: i64) -> bool {
         let info = self.server_info();
 
-        let server_version_captures = match VERSION_RE.captures(&info.version) {
-            Some(captures) => captures,
-            None => return false,
-        };
-
-        let server_major = server_version_captures
-            .get(1)
-            .map(|m| m.as_str().parse::<i64>().unwrap())
-            .unwrap();
-
-        let server_minor = server_version_captures
-            .get(2)
-            .map(|m| m.as_str().parse::<i64>().unwrap())
-            .unwrap();
-
-        let server_patch = server_version_captures
-            .get(3)
-            .map(|m| m.as_str().parse::<i64>().unwrap())
-            .unwrap();
-
-        if server_major < major
-            || (server_major == major && server_minor < minor)
-            || (server_major == major && server_minor == minor && server_patch < patch)
-        {
-            return false;
-        }
-        true
+        server_version_at_least(&info.version, major, minor, patch)
     }
 
     /// Publish a [Message] to a given subject.
+    ///
+    /// Returns `PublishErrorKind::InvalidSubject` if the subject is invalid
+    /// (empty or contains whitespace). This check can be disabled with
+    /// [`ConnectOptions::skip_subject_validation`][crate::ConnectOptions::skip_subject_validation] (empty subjects are
+    /// always rejected).
     ///
     /// # Examples
     /// ```no_run
@@ -305,21 +429,15 @@ impl Client {
         subject: S,
         payload: Bytes,
     ) -> Result<(), PublishError> {
-        let subject = subject.to_subject();
-        let max_payload = self.max_payload.load(Ordering::Relaxed);
-        if payload.len() > max_payload {
-            return Err(PublishError::with_source(
-                PublishErrorKind::MaxPayloadExceeded,
-                format!(
-                    "Payload size limit of {} exceeded by message size of {}",
-                    max_payload,
-                    payload.len(),
-                ),
-            ));
-        }
+        let subject = self
+            .maybe_validate_publish_subject(subject)
+            .map_err(|e| PublishError::with_source(PublishErrorKind::InvalidSubject, e))?;
+
+        self.check_payload_size(None, payload.len())
+            .map_err(max_payload_error)?;
 
         self.sender
-            .send(Command::Publish(PublishMessage {
+            .send(Command::Publish(OutboundMessage {
                 subject,
                 payload,
                 reply: None,
@@ -354,10 +472,15 @@ impl Client {
         headers: HeaderMap,
         payload: Bytes,
     ) -> Result<(), PublishError> {
-        let subject = subject.to_subject();
+        let subject = self
+            .maybe_validate_publish_subject(subject)
+            .map_err(|e| PublishError::with_source(PublishErrorKind::InvalidSubject, e))?;
+
+        self.check_payload_size(Some(&headers), payload.len())
+            .map_err(max_payload_error)?;
 
         self.sender
-            .send(Command::Publish(PublishMessage {
+            .send(Command::Publish(OutboundMessage {
                 subject,
                 payload,
                 reply: None,
@@ -389,11 +512,18 @@ impl Client {
         reply: R,
         payload: Bytes,
     ) -> Result<(), PublishError> {
-        let subject = subject.to_subject();
-        let reply = reply.to_subject();
+        let subject = self
+            .maybe_validate_publish_subject(subject)
+            .map_err(|e| PublishError::with_source(PublishErrorKind::InvalidSubject, e))?;
+        let reply = self
+            .maybe_validate_publish_subject(reply)
+            .map_err(|e| PublishError::with_source(PublishErrorKind::InvalidSubject, e))?;
+
+        self.check_payload_size(None, payload.len())
+            .map_err(max_payload_error)?;
 
         self.sender
-            .send(Command::Publish(PublishMessage {
+            .send(Command::Publish(OutboundMessage {
                 subject,
                 payload,
                 reply: Some(reply),
@@ -428,11 +558,18 @@ impl Client {
         headers: HeaderMap,
         payload: Bytes,
     ) -> Result<(), PublishError> {
-        let subject = subject.to_subject();
-        let reply = reply.to_subject();
+        let subject = self
+            .maybe_validate_publish_subject(subject)
+            .map_err(|e| PublishError::with_source(PublishErrorKind::InvalidSubject, e))?;
+        let reply = self
+            .maybe_validate_publish_subject(reply)
+            .map_err(|e| PublishError::with_source(PublishErrorKind::InvalidSubject, e))?;
+
+        self.check_payload_size(Some(&headers), payload.len())
+            .map_err(max_payload_error)?;
 
         self.sender
-            .send(Command::Publish(PublishMessage {
+            .send(Command::Publish(OutboundMessage {
                 subject,
                 payload,
                 reply: Some(reply),
@@ -458,13 +595,6 @@ impl Client {
         subject: S,
         payload: Bytes,
     ) -> Result<Message, RequestError> {
-        let subject = subject.to_subject();
-
-        trace!(
-            "request sent to subject: {} ({})",
-            subject.as_ref(),
-            payload.len()
-        );
         let request = Request::new().payload(payload);
         self.send_request(subject, request).await
     }
@@ -490,13 +620,14 @@ impl Client {
         headers: HeaderMap,
         payload: Bytes,
     ) -> Result<Message, RequestError> {
-        let subject = subject.to_subject();
-
         let request = Request::new().headers(headers).payload(payload);
         self.send_request(subject, request).await
     }
 
     /// Sends the request created by the [Request].
+    ///
+    /// Returns `RequestErrorKind::InvalidSubject` if the subject is invalid
+    /// (empty or contains whitespace).
     ///
     /// # Examples
     ///
@@ -514,7 +645,21 @@ impl Client {
         subject: S,
         request: Request,
     ) -> Result<Message, RequestError> {
-        let subject = subject.to_subject();
+        let subject = self
+            .maybe_validate_publish_subject(subject)
+            .map_err(|e| RequestError::with_source(RequestErrorKind::InvalidSubject, e))?;
+
+        // Reject oversized requests up front, else they'd be sent and time out.
+        self.check_payload_size(
+            request.headers.as_ref(),
+            request.payload.as_ref().map_or(0, Bytes::len),
+        )
+        .map_err(|sizes| {
+            RequestError::with_source(
+                RequestErrorKind::MaxPayloadExceeded,
+                max_payload_message(sizes),
+            )
+        })?;
 
         if let Some(inbox) = request.inbox {
             let timeout = request.timeout.unwrap_or(self.request_timeout);
@@ -607,10 +752,14 @@ impl Client {
     /// # }
     /// ```
     pub fn new_inbox(&self) -> String {
-        format!("{}.{}", self.inbox_prefix, nuid::next())
+        format!("{}.{}", self.inbox_prefix, crate::id_generator::next())
     }
 
     /// Subscribes to a subject to receive [messages][Message].
+    ///
+    /// Returns an error if the subject is invalid (empty, contains whitespace,
+    /// or has malformed dot structure). This validation always runs regardless
+    /// of [`ConnectOptions::skip_subject_validation`][crate::ConnectOptions::skip_subject_validation].
     ///
     /// # Examples
     ///
@@ -627,7 +776,10 @@ impl Client {
     /// # }
     /// ```
     pub async fn subscribe<S: ToSubject>(&self, subject: S) -> Result<Subscriber, SubscribeError> {
-        let subject = subject.to_subject();
+        let subject = self
+            .validate_subscribe_subject(subject)
+            .map_err(|e| SubscribeError::with_source(SubscribeErrorKind::InvalidSubject, e))?;
+
         let sid = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(self.subscription_capacity);
 
@@ -644,6 +796,11 @@ impl Client {
     }
 
     /// Subscribes to a subject with a queue group to receive [messages][Message].
+    ///
+    /// Returns an error if the subject is invalid (empty, contains whitespace,
+    /// or has malformed dot structure) or if the queue group name is invalid
+    /// (empty or contains whitespace). Subject and queue group validation always
+    /// runs regardless of [`ConnectOptions::skip_subject_validation`][crate::ConnectOptions::skip_subject_validation].
     ///
     /// # Examples
     ///
@@ -664,7 +821,13 @@ impl Client {
         subject: S,
         queue_group: String,
     ) -> Result<Subscriber, SubscribeError> {
-        let subject = subject.to_subject();
+        let subject = self
+            .validate_subscribe_subject(subject)
+            .map_err(|e| SubscribeError::with_source(SubscribeErrorKind::InvalidSubject, e))?;
+
+        if !crate::is_valid_queue_group(&queue_group) {
+            return Err(SubscribeError::new(SubscribeErrorKind::InvalidQueueName));
+        }
 
         let sid = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(self.subscription_capacity);
@@ -706,8 +869,8 @@ impl Client {
     }
 
     /// Drains all subscriptions, stops any new messages from being published, and flushes any remaining
-    /// messages, then closes the connection. Once completed, any associated streams associated with the
-    /// client will be closed, and further client commands will fail
+    /// messages, then closes the connection. Once completed, any streams associated with the
+    /// connection and its [Clients](crate::Client) will be closed, and further [crate::Client] commands will fail.
     ///
     /// # Examples
     ///
@@ -776,6 +939,122 @@ impl Client {
             .map_err(Into::into)
     }
 
+    /// Replaces the server pool used for reconnection attempts.
+    ///
+    /// The new pool takes effect on the next reconnect attempt; it does not
+    /// trigger an immediate reconnect. To force an immediate reconnect with
+    /// the new pool, call [`Client::force_reconnect`] after this method.
+    ///
+    /// Per-server state (failed attempt count, connection history) is preserved
+    /// for servers that appear in both the old and new pools.
+    ///
+    /// A server given in the pool is a configured server, also when the client discovered
+    /// it from the cluster: its certificate is verified as configured, not against a name
+    /// learned through discovery. One the client learned over TLS keeps TLS as long as
+    /// every pool given since lists it, unless
+    /// [`ConnectOptions::tls_optional`](crate::ConnectOptions::tls_optional) is set: each
+    /// URL is then dialed with its own scheme. A pool that leaves a server out drops what
+    /// the client learned about it, and so does a list from the cluster that leaves out a
+    /// discovered server other than the one the client is connected to.
+    /// [`Client::server_pool`] lists a discovered server the client learned over TLS with a
+    /// `tls://` or `wss://` URL, so a pool made from that list keeps TLS for it; without
+    /// `tls_optional`, that URL then asks for TLS, as below.
+    ///
+    /// This also resets the global reconnection attempt counter, so any
+    /// progress toward [`ConnectOptions::max_reconnects`](crate::ConnectOptions::max_reconnects)
+    /// is cleared.
+    ///
+    /// A `tls://` or `wss://` URL in the pool makes the client ask for TLS, as the same URL
+    /// does at connect: from the next attempt on, every server is dialed with TLS, the
+    /// other URLs of the pool and the servers discovered from the cluster included. The
+    /// current connection is not closed. A later pool without such a URL does not turn TLS
+    /// off. With [`ConnectOptions::tls_optional`](crate::ConnectOptions::tls_optional) set,
+    /// such a URL gets TLS for itself only, as at connect.
+    ///
+    /// The pool is checked as the server list at connect is. When the client asks for TLS,
+    /// or would with the new pool, a `ws://` URL is refused with
+    /// [`SetServerPoolErrorKind::Configuration`], and so is a pool that asks for TLS in a
+    /// build without the `native-certs` feature while neither root certificates nor a
+    /// rustls client config are given; the pool and whether the client asks for TLS are left
+    /// as they were.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// let client = async_nats::connect("demo.nats.io").await?;
+    /// client
+    ///     .set_server_pool(["nats://server1:4222", "nats://server2:4222"].as_slice())
+    ///     .await?;
+    /// // Optionally force reconnect to apply immediately:
+    /// client.force_reconnect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_server_pool<A: crate::ToServerAddrs>(
+        &self,
+        addrs: A,
+    ) -> Result<(), SetServerPoolError> {
+        let servers: Vec<crate::ServerAddr> = addrs
+            .to_server_addrs()
+            .map_err(|err| {
+                SetServerPoolError::with_source(SetServerPoolErrorKind::InvalidAddress, err)
+            })?
+            .collect();
+
+        if servers.is_empty() {
+            return Err(SetServerPoolError::new(SetServerPoolErrorKind::EmptyPool));
+        }
+
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(Command::SetServerPool {
+                servers,
+                result: tx,
+            })
+            .await
+            .map_err(|err| SetServerPoolError::with_source(SetServerPoolErrorKind::Send, err))?;
+
+        rx.await
+            .map_err(|err| SetServerPoolError::with_source(SetServerPoolErrorKind::Send, err))?
+    }
+
+    /// Returns a snapshot of the current server pool.
+    ///
+    /// The returned list includes both explicitly configured and discovered
+    /// servers, along with per-server metadata such as reconnect count and
+    /// connection history.
+    ///
+    /// A discovered server is listed with the transport it was learned on, `nats://` or
+    /// `ws://`, and with `tls://` or `wss://` when the client learned it over TLS, so that the
+    /// list given back to [`Client::set_server_pool`] keeps TLS for it.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::Error> {
+    /// let client = async_nats::connect("demo.nats.io").await?;
+    /// let pool = client.server_pool().await?;
+    /// for server in &pool {
+    ///     println!(
+    ///         "{:?}: {} failed attempts",
+    ///         server.addr, server.failed_attempts
+    ///     );
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn server_pool(&self) -> Result<Vec<crate::Server>, ServerPoolError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(Command::ServerPool { result: tx })
+            .await
+            .map_err(|err| ServerPoolError::with_source(ServerPoolErrorKind::Send, err))?;
+
+        rx.await
+            .map_err(|err| ServerPoolError::with_source(ServerPoolErrorKind::Send, err))
+    }
+
     /// Returns struct representing statistics of the whole lifecycle of the client.
     /// This includes number of bytes sent/received, number of messages sent/received,
     /// and number of times the connection was established.
@@ -800,10 +1079,10 @@ impl Client {
 /// Used for building customized requests.
 #[derive(Default)]
 pub struct Request {
-    payload: Option<Bytes>,
-    headers: Option<HeaderMap>,
-    timeout: Option<Option<Duration>>,
-    inbox: Option<String>,
+    pub payload: Option<Bytes>,
+    pub headers: Option<HeaderMap>,
+    pub timeout: Option<Option<Duration>>,
+    pub inbox: Option<String>,
 }
 
 impl Request {
@@ -853,7 +1132,9 @@ impl Request {
         self
     }
 
-    /// Sets the custom timeout of the request. Overrides default [Client] timeout.
+    /// Sets the custom timeout of the request. Overrides default [Client] timeout, and the
+    /// JetStream context timeout when the request is sent with the `Requester` implementation
+    /// of a JetStream context.
     /// Setting it to [Option::None] disables the timeout entirely which might result in deadlock.
     /// To use default timeout, simply do not call this function.
     ///
@@ -905,13 +1186,85 @@ impl From<tokio::sync::mpsc::error::SendError<Command>> for ReconnectError {
     }
 }
 
-#[derive(Error, Debug)]
-#[error("failed to send subscribe: {0}")]
-pub struct SubscribeError(#[source] crate::Error);
+/// An error returned from [`Client::set_server_pool`].
+pub type SetServerPoolError = Error<SetServerPoolErrorKind>;
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum SetServerPoolErrorKind {
+    /// Failed to send command to the connection handler.
+    Send,
+    /// One or more server addresses could not be parsed.
+    InvalidAddress,
+    /// The pool contains a mix of WebSocket (`ws://`, `wss://`) and
+    /// non-websocket (`nats://`, `tls://`) URLs, which is not allowed.
+    MixedSchemes,
+    /// The server pool cannot be empty.
+    EmptyPool,
+    /// The pool holds a server URL this build or the client's settings cannot connect
+    /// to, or asks for TLS this build has no root certificates for, as
+    /// [`ConnectErrorKind::Configuration`](crate::ConnectErrorKind::Configuration) would
+    /// refuse it at connect. The pool is unchanged.
+    Configuration,
+}
+
+impl Display for SetServerPoolErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Send => write!(f, "failed to send set_server_pool command"),
+            Self::InvalidAddress => write!(f, "invalid server address"),
+            Self::EmptyPool => write!(f, "server pool cannot be empty"),
+            Self::MixedSchemes => write!(
+                f,
+                "cannot mix websocket and non-websocket URLs in server pool"
+            ),
+            Self::Configuration => write!(f, "configuration error"),
+        }
+    }
+}
+
+/// An error returned from [`Client::server_pool`].
+pub type ServerPoolError = Error<ServerPoolErrorKind>;
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ServerPoolErrorKind {
+    /// Failed to send command to the connection handler.
+    Send,
+}
+
+impl Display for ServerPoolErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Send => write!(f, "failed to send server_pool command"),
+        }
+    }
+}
+
+/// An error returned from the [`Client::subscribe`] or [`Client::queue_subscribe`] functions.
+pub type SubscribeError = Error<SubscribeErrorKind>;
 
 impl From<tokio::sync::mpsc::error::SendError<Command>> for SubscribeError {
     fn from(err: tokio::sync::mpsc::error::SendError<Command>) -> Self {
-        SubscribeError(Box::new(err))
+        SubscribeError::with_source(SubscribeErrorKind::Other, err)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum SubscribeErrorKind {
+    /// The subject is invalid (empty, contains whitespace, or has malformed dot structure).
+    InvalidSubject,
+    /// The queue group name is invalid (empty or contains whitespace).
+    InvalidQueueName,
+    /// Other errors, client/io related.
+    Other,
+}
+
+impl Display for SubscribeErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSubject => write!(f, "invalid subject"),
+            Self::InvalidQueueName => write!(f, "invalid queue name"),
+            Self::Other => write!(f, "subscribe failed"),
+        }
     }
 }
 
@@ -932,6 +1285,10 @@ pub enum RequestErrorKind {
     TimedOut,
     /// No one is listening on request subject.
     NoResponders,
+    /// The subject is invalid (empty or contains whitespace).
+    InvalidSubject,
+    /// The payload (plus headers) exceeds the server's `max_payload`.
+    MaxPayloadExceeded,
     /// Other errors, client/io related.
     Other,
 }
@@ -941,6 +1298,8 @@ impl Display for RequestErrorKind {
         match self {
             Self::TimedOut => write!(f, "request timed out"),
             Self::NoResponders => write!(f, "no responders"),
+            Self::InvalidSubject => write!(f, "invalid subject"),
+            Self::MaxPayloadExceeded => write!(f, "max payload size exceeded"),
             Self::Other => write!(f, "request failed"),
         }
     }
@@ -997,4 +1356,60 @@ pub struct Statistics {
     /// Number of times connection was established.
     /// Initial connect will be counted as well, then all successful reconnects.
     pub connects: AtomicU64,
+}
+
+#[cfg(test)]
+mod server_version_tests {
+    use super::server_version_at_least;
+
+    #[test]
+    fn compares_three_numbers() {
+        assert!(server_version_at_least("2.11.4", 2, 11, 4));
+        assert!(server_version_at_least("2.11.4", 2, 8, 4));
+        assert!(server_version_at_least("3.0.0", 2, 99, 99));
+        assert!(!server_version_at_least("2.11.4", 2, 11, 5));
+        assert!(!server_version_at_least("2.11.4", 2, 12, 0));
+        assert!(!server_version_at_least("2.11.4", 3, 0, 0));
+    }
+
+    #[test]
+    fn pre_release_counts_as_its_release() {
+        assert!(server_version_at_least("2.12.0-beta.1", 2, 12, 0));
+        assert!(server_version_at_least("2.12.0+build", 2, 12, 0));
+    }
+
+    #[test]
+    fn unparsable_version_is_not_compatible() {
+        // These used to panic: a missing component, and one that does not fit.
+        assert!(!server_version_at_least("2", 2, 0, 0));
+        assert!(!server_version_at_least("2.11", 2, 0, 0));
+        assert!(!server_version_at_least(
+            "99999999999999999999.0.0",
+            2,
+            0,
+            0
+        ));
+        assert!(!server_version_at_least(
+            "2.99999999999999999999.0",
+            2,
+            0,
+            0
+        ));
+        // These returned false or true before; all are refused now, as on connect.
+        assert!(!server_version_at_least("", 0, 0, 0));
+        assert!(!server_version_at_least("dev", 0, 0, 0));
+        assert!(!server_version_at_least("v2.10.0", 2, 0, 0));
+        assert!(!server_version_at_least("2.10.0.1", 2, 0, 0));
+    }
+
+    #[test]
+    fn negative_arguments_match_any_parsed_version() {
+        assert!(server_version_at_least("0.0.0", -1, 0, 0));
+        assert!(server_version_at_least(
+            "18446744073709551615.0.0",
+            i64::MAX,
+            0,
+            0
+        ));
+    }
 }

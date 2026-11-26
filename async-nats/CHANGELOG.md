@@ -1,3 +1,357 @@
+# v0.53.0
+
+## Overview
+
+This release fixes security issues in how the client decides to use TLS and which servers it takes from the cluster. Some fixes change how the client connects: read the breaking and behaviour changes before upgrading.
+
+## Added
+* `ConnectOptions::tls_optional` (#1686), `ConnectOptions::tls_server_name` and `ConnectOptions::verify_discovered_servers_by_ip` (#1687)
+
+## Fixed
+* TLS options: one TLS requirement per connection, an opt-out, and configuration errors by @Jarema in https://github.com/nats-io/nats.rs/pull/1686
+* Discovered servers: host:port entries, learned transport and TLS, trusted names by @Jarema in https://github.com/nats-io/nats.rs/pull/1687
+* Use the server list from the INFO received inside TLS; apply later lists by @Jarema in https://github.com/nats-io/nats.rs/pull/1688
+* Return an error instead of panicking on two malformed server lines by @Jarema in https://github.com/nats-io/nats.rs/pull/1681
+* Fix clippy needless_bool in is_server_compatible by @Jarema in https://github.com/nats-io/nats.rs/pull/1682
+
+## Changed
+* Document the TLS settings on ConnectOptions and README by @Jarema in https://github.com/nats-io/nats.rs/pull/1689
+
+## Breaking changes
+* **New `Configuration` variants** of `ConnectErrorKind` and `SetServerPoolErrorKind`, and a public field `ServerInfo::tls_available`. Exhaustive `match`es need a new arm, `ServerInfo` literals need `..Default::default()` (#1686)
+* **A server without TLS where TLS is asked for, or a certificate not valid for the expected name, is a `Tls` error,** not `Io`. For the name check, the `io::Error` is one `source()` deeper (#1686, #1687)
+* **WebSocket connections open on the client's own TCP stream,** so every resolved address is tried and `local_address` applies. A failed TCP connect or TLS handshake no longer has a `tokio_websockets::Error` as its source (#1686)
+* **tokio-rustls 0.26.3** or later, which needs rustls 0.23.27 (#1687)
+
+## Behaviour changes
+* **TLS settings ask for TLS.** Root certificates, a client certificate, `tls_client_config()` and the new `tls_server_name()` and `verify_discovered_servers_by_ip()` act like `require_tls(true)`. Against a server without TLS, the connection fails with an error naming the server and the setting. To leave TLS to each server, set `tls_optional()` (#1686, #1687)
+* **TLS applies to every server.** When anything asks for TLS, every server is dialed with TLS: discovered servers, reconnects, `nats://` URLs in a mixed list, and every attempt once `Client::set_server_pool` is given a `tls://` or `wss://` URL. Then `connect` and `set_server_pool` refuse a `ws://` URL with a `Configuration` error: write `wss://`. `tls_optional()` dials each URL with its own scheme. A build without the `websockets` feature refuses any WebSocket URL (#1686)
+* **Discovered servers keep the transport and TLS they were learned on.** A node without TLS is no longer reached through nodes with TLS: configure it at connect as a `nats://` URL, with `tls_optional()` if the client asks for TLS. `Client::server_pool()` and `reconnect_to_server_callback` list a server learned over TLS as `tls://` or `wss://`, and one learned over WebSocket as `ws://`; a callback that returns another URL gets `ClientError::ServerNotInPool`. A server given to `Client::set_server_pool` is verified like a configured server (#1687)
+* **A `connect_urls` entry is `host:port` only.** Other entries are skipped with a log line. User info in an entry is dropped and the client uses its own credentials (#1687)
+* **Discovered servers are verified against a name the client trusts:** a discovered IP address against the name its reporting server was verified under. A cluster whose certificates carry only IP addresses needs `verify_discovered_servers_by_ip()`; a client that reaches a cluster by IP address needs that or `tls_server_name()`. A discovered host name is verified against itself: with system or shared roots, give the cluster's CA as the only root, or set `ignore_discovered_servers()` (#1687)
+* **A server that requires TLS, learned over a connection without TLS,** is verified against the configured server's host name if it is listed by IP address, and is not connected to if it is listed by host name. Set `tls_optional()`, plus a `tls://` URL for that server or `tls_server_name()` (#1687)
+* **With TLS after INFO (not `tls_first()`), discovered servers come only from the INFO received inside TLS.** Against nats-server before 2.12, a client configured with one server may have nothing to fail over to: configure more than one, or use `tls_first()`. Against 2.12 or later, each attempt waits for the INFO after the first PONG, up to the connection timeout; `ignore_discovered_servers()` skips it (#1688)
+* **Later INFOs are applied.** A `connect_urls` list on an established connection replaces the discovered servers, as in nats.go. `Client::server_info()` and `max_payload` follow every INFO; `server_info().nonce` is empty after a later one, which with TLS after INFO against 2.12 or later is at connect (#1688)
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.52.0...async-nats/v0.53.0
+
+
+
+# v0.52.0
+## Overview
+
+This release fixes panics on line breaks in header values. A `\r` inside a received header value panicked the connection task, so any client allowed to publish on a subject could stop its subscribers' connections. Upgrading is recommended.
+
+It is a minor release because `HeaderValue` no longer implements `From<&str>` and `From<String>`.
+
+## Fixed
+* Fix panic on line breaks in header values by @Jarema in https://github.com/nats-io/nats.rs/pull/1673
+
+## Breaking changes
+* `HeaderValue` no longer implements `From<&str>` and `From<String>`. It implements `TryFrom<&str>`, `TryFrom<&String>` and `TryFrom<String>` instead, returning `ParseHeaderValueError` for a value with `\r` or `\n` (#1673). Affected code fails to compile:
+  * `headers.insert(k, HeaderValue::from(s))` → `headers.insert(k, s)`
+  * `HeaderValue::from(s)`, `s.into()` → `HeaderValue::try_from(s)?` to reject line breaks, `HeaderValue::from_lossy(s)` to replace them
+  * `T: Into<HeaderValue>` → `T: IntoHeaderValue`
+  * `let Ok(v) = HeaderValue::try_from(s)` → handle `ParseHeaderValueError`, the error is no longer `Infallible`
+
+  String and integer values passed straight to `insert` or `append`, and `str::parse`, keep working.
+
+## Behaviour changes
+* A string header value with `\r` or `\n` gets a space in place of each instead of panicking. This covers `HeaderMap::insert` and `append`, `PublishMessage::header`, `message_id` and `expected_*`, service `respond(Err(..))` and received messages. To reject such a value, convert it with `HeaderValue::try_from` first (#1673).
+* `Stream::get_raw_message`, `get_last_raw_message_by_subject` and KV `entry` without direct get no longer fail on such a header value; they replace the line breaks the same way (#1673).
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.51.0...async-nats/v0.52.0
+
+
+# v0.51.0
+## Overview
+
+This release adds pinned client support for pull consumers and fixes a number of panics and hangs across JetStream, KV, Object Store and Service APIs.
+JetStream API requests are now bounded by the JetStream context timeout when it is set.
+
+It is a minor release because it adds variants to error kind enums, adds public fields to consumer types and raises the MSRV to 1.89.
+
+## Added
+* Add pinned client support for pull consumers by @Nielswps in https://github.com/nats-io/nats.rs/pull/1652
+* Add priority_timeout, unpin_consumer and consumer priority group state by @Nielswps in https://github.com/nats-io/nats.rs/pull/1653
+* Add docs.nats.io examples by @Jarema in https://github.com/nats-io/nats.rs/pull/1610
+
+## Fixed
+* Fix FetchBuilder::priority overwriting batch size instead of setting priority by @Jarema in https://github.com/nats-io/nats.rs/pull/1620
+* Accept the 11-token v2 JetStream ack subject by @Jarema in https://github.com/nats-io/nats.rs/pull/1624
+* Fix object store reads panicking on a JetStream timeout by @macrauder in https://github.com/nats-io/nats.rs/pull/1621
+* Avoid panic in Subscriber::drop when dropped outside a runtime by @lives-hoth in https://github.com/nats-io/nats.rs/pull/1608
+* Fix spurious MissingHeartbeat while consumer messages are buffered by @Jarema in https://github.com/nats-io/nats.rs/pull/1627
+* Stop pull consumers from hot-looping on 409 Exceeded MaxRequest* by @Jarema in https://github.com/nats-io/nats.rs/pull/1631
+* Fix KV history and keys hanging when no entry arrives by @Jarema in https://github.com/nats-io/nats.rs/pull/1635
+* Bound JetStream API requests by the context timeout when it is set by @Jarema in https://github.com/nats-io/nats.rs/pull/1636
+* Fix service verb handler panicking on requests without a reply subject by @cacoco in https://github.com/nats-io/nats.rs/pull/1640
+* Fix Service::stop leaving the service registered when no endpoint listens by @cacoco in https://github.com/nats-io/nats.rs/pull/1658
+* Fix service error Display swapping code and status by @SashaMIT in https://github.com/nats-io/nats.rs/pull/1645
+* Redact secrets in ConnectInfo Debug output by @stasimus in https://github.com/nats-io/nats.rs/pull/1616
+
+## Changed
+* Use direct get in ObjectStore::info() when the stream allows it by @sheapwilliams in https://github.com/nats-io/nats.rs/pull/1632
+* Improve ordered consumers naming by @Jarema in https://github.com/nats-io/nats.rs/pull/1626
+* Clean up websocket dependencies and update tokio-websockets to 0.13.3 by @Jarema in https://github.com/nats-io/nats.rs/pull/1656
+* Tidy the object store read error path by @Jarema in https://github.com/nats-io/nats.rs/pull/1625
+
+## Breaking changes
+* MSRV is now Rust 1.89, required by tokio-websockets 0.13 (#1656).
+* The minimum aws-lc-rs version is now 1.18, as older releases allow an aws-lc-fips-sys that does not build with CMake 4. Under `fips` this moves the bundled AWS-LC-FIPS module from 3.x to 4.x.
+* New error kind variants: `MessagesErrorKind::RequestLimitExceeded` and `OrderedErrorKind::RequestLimitExceeded` (#1631), `BatchErrorKind::PinnedClient` (#1652). Exhaustive `match`es on these enums need a new arm.
+* New public fields behind `server_2_11`: `priority_timeout` on `consumer::Config` and `pull::Config`, `priority_groups` on `consumer::Info` (#1653). Struct literals without `..Default::default()` need updating (`Info` has no `Default`).
+* Websocket errors behind `ConnectError` sources are now tokio-websockets 0.13 types, so downcasts to the 0.10 type stop matching (#1656).
+
+## Behaviour changes
+* When the JetStream context timeout (`ContextBuilder::timeout`, `Context::set_timeout`) is set, it is now the only bound for every JetStream API request, whether it is lower or higher than the connection `request_timeout`. When it is not set, API requests keep using `request_timeout` (#1636).
+* `fetch()`, `batch()` and `sequence()` return `BatchErrorKind::PinnedClient` on a `PriorityPolicy::PinnedClient` consumer. Use `stream()` or `messages()` instead (#1652).
+* A pull consumer stream rejected with `409 Exceeded MaxRequest*` now ends with `MessagesErrorKind::RequestLimitExceeded` instead of re-pulling forever. Batch and expiry defaults the user did not set are capped at the consumer's limits, and `OrderedConfig::max_batch` now reaches the server (#1631).
+* A recreated ordered consumer is named `{name}_{n}`, using the configured name or the name the server gave the first consumer. The previous consumer is now deleted on recreation, unnamed ones included (#1626).
+* `ObjectStore::info()`, and so `put()`, uses direct get when the stream allows it, so lookups of missing objects no longer count as JetStream API errors (#1632).
+* For `ws://` and `wss://` on the default port, the Host header no longer includes the port. webpki-roots is no longer a dependency (#1656).
+
+## New Contributors
+* @macrauder made their first contribution in https://github.com/nats-io/nats.rs/pull/1621
+* @lives-hoth made their first contribution in https://github.com/nats-io/nats.rs/pull/1608
+* @sheapwilliams made their first contribution in https://github.com/nats-io/nats.rs/pull/1632
+* @cacoco made their first contribution in https://github.com/nats-io/nats.rs/pull/1640
+* @Nielswps made their first contribution in https://github.com/nats-io/nats.rs/pull/1653
+* @SashaMIT made their first contribution in https://github.com/nats-io/nats.rs/pull/1645
+* @stasimus made their first contribution in https://github.com/nats-io/nats.rs/pull/1616
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.50.0...async-nats/v0.51.0
+
+# v0.50.0
+## Overview
+
+This release allows for on-demand swap between `chrono` and `time` crates.
+
+## What's Changed
+* Add chrono as alternative to time crate by @Jarema in https://github.com/nats-io/nats.rs/pull/1595
+* Use new start method for retry start in nats-server crate by @Jarema in https://github.com/nats-io/nats.rs/pull/1603
+* Fix account info deser failure on servers with tiered jetstream by @xanderio in https://github.com/nats-io/nats.rs/pull/1604
+
+## Chrono vs Time
+
+Enabling `chrono` anywhere in the
+dependency graph selects the chrono backend for the whole build (Cargo feature unification).
+
+
+## New Contributors
+* @xanderio made their first contribution in https://github.com/nats-io/nats.rs/pull/1604
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.49.1...async-nats/v0.50.0
+
+# v0.49.1
+## Overview
+Release focusing on fixing behaviour around server connectivity.
+
+## What's Changed
+* Fix ping interval reset by @Jarema in https://github.com/nats-io/nats.rs/pull/1594
+* Fix recreating ordered consumer on server restart by @Jarema in https://github.com/nats-io/nats.rs/pull/1599
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.49.0...async-nats/v0.49.1
+
+# v0.49.0
+## Overview
+
+This is a small release adding missing client-side max-payload validations for some methods.
+It is a minor release as it adds new error kind variants for relevant calls.
+
+## What's Changed
+* Add TryFrom impls for HeaderName by @yordis in https://github.com/nats-io/nats.rs/pull/1587
+* Add max payload validation where it was missing by @Jarema in https://github.com/nats-io/nats.rs/pull/1590
+
+## New Contributors
+* @scottf made their first contribution in https://github.com/nats-io/nats.rs/pull/1579
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.48.0...async-nats/v0.49.0
+
+# v0.48.0
+## Added
+* Add recent jetstream error codes by @Jarema in https://github.com/nats-io/nats.rs/pull/1564
+* Add server pool callback by @Jarema in https://github.com/nats-io/nats.rs/pull/1559
+* Add Source.consumer for durable sourcing by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+* Add AckPolicy::FlowControl by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+* Add Consumer Reset API by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+* Add 2.14 schedule, batch, and rollup header constants by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+* Add PublishAck batch_id and batch_size fields by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+* Add `try_server_info` and `max_payload` methods by @yordis in https://github.com/nats-io/nats.rs/pull/1567
+
+## Fixed
+* Fix typo in create_or_update_key_value example by @ayymart in https://github.com/nats-io/nats.rs/pull/1569
+* Fix linter warning by @Jarema in https://github.com/nats-io/nats.rs/pull/1570
+* Preserve unsubscribe_after limit across reconnects by @MattPatchava in https://github.com/nats-io/nats.rs/pull/1560
+* Fix panic on reading non-utf8 data by @Jarema in https://github.com/nats-io/nats.rs/pull/1573
+
+## Changed
+* Bump rand by @Jarema in https://github.com/nats-io/nats.rs/pull/1566
+* Bump to thiserror v2 by @aumetra in https://github.com/nats-io/nats.rs/pull/1571
+* Orbit docs by @Jarema in https://github.com/nats-io/nats.rs/pull/1580
+* Cover remaining 2.14 server error codes and predefined cron schedules by @Jarema in https://github.com/nats-io/nats.rs/pull/1581
+
+## New Contributors
+* @ayymart made their first contribution in https://github.com/nats-io/nats.rs/pull/1569
+* @aumetra made their first contribution in https://github.com/nats-io/nats.rs/pull/1571
+* @yordis made their first contribution in https://github.com/nats-io/nats.rs/pull/1567
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.47.0...async-nats/v0.48.0
+# v0.47.0
+
+This release adds subject validation (with opt-out possibility) and wraps while connect attempt in timeout, making it more robust.
+
+## Added
+* Add Subject Validation by @Jarema in https://github.com/nats-io/nats.rs/pull/1525
+* Add respond_with_headers method to handle responses with custom headers by @giddyos in https://github.com/nats-io/nats.rs/pull/1554
+* Add local_address option to bind client to a specific local IP by @wallyqs in https://github.com/nats-io/nats.rs/pull/1539
+* Implement Clone for ConnectOptions by @MattPatchava in https://github.com/nats-io/nats.rs/pull/1552
+
+## Fixed
+* Fix invalid consumer rate limit json by @Totodore in https://github.com/nats-io/nats.rs/pull/1536
+* Return error instead of panic when reply subject is empty by @liamkinne in https://github.com/nats-io/nats.rs/pull/1514
+* Use proper doc comments by @Xaeroxe in https://github.com/nats-io/nats.rs/pull/1543
+* Fix connection_timeout to cover full NATS handshake by @rahsonaw in https://github.com/nats-io/nats.rs/pull/1544
+
+## Changed
+* Update rustls-native-certs from 0.7 to 0.8 by @FreeMasen in https://github.com/nats-io/nats.rs/pull/1507
+* Remove `once_cell` and use std::sync::LazyLock instead by @Jarema in https://github.com/nats-io/nats.rs/pull/1534
+* Bump bytes crate by @Jarema in https://github.com/nats-io/nats.rs/pull/1540
+* Bump msrv by @Jarema in https://github.com/nats-io/nats.rs/pull/1509
+* Update rustls-webpki to 0.103.10 by @JohnMoon-Voyager in https://github.com/nats-io/nats.rs/pull/1550
+* Update dictionary by @Jarema in https://github.com/nats-io/nats.rs/pull/1556
+
+## New Contributors
+* @FreeMasen made their first contribution in https://github.com/nats-io/nats.rs/pull/1507
+* @Xaeroxe made their first contribution in https://github.com/nats-io/nats.rs/pull/1543
+* @MattPatchava made their first contribution in https://github.com/nats-io/nats.rs/pull/1552
+* @JohnMoon-Voyager made their first contribution in https://github.com/nats-io/nats.rs/pull/1550
+* @giddyos made their first contribution in https://github.com/nats-io/nats.rs/pull/1554
+* @rahsonaw made their first contribution in https://github.com/nats-io/nats.rs/pull/1544
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.46.0...async-nats/v0.47.0
+
+
+# v0.46.0
+
+This release introduces disabled by default feature-gating of features and modules.
+Users can now disable `nkeys`, `object-store`, or others, to limit the size of the final binary and dependency pulled in.
+
+## Added
+* Hide features & modules behind feature flags by @Jarema in https://github.com/nats-io/nats.rs/pull/1494
+
+## Fixed
+* Eliminate build-time warnings for `async-nats` by @vkolomeyko in https://github.com/nats-io/nats.rs/pull/1489
+* Fix error deserialization when err_code is absent by @Jarema in https://github.com/nats-io/nats.rs/pull/1497
+* Fix slow subscription shutdown after drain by @Jarema in https://github.com/nats-io/nats.rs/pull/1504
+
+## Changed
+* Relax type constraints around `ServiceBuilder::start` by @vkolomeyko in https://github.com/nats-io/nats.rs/pull/1486
+* Use with_source for CreateError to maintain original error source by @LouiseSianEvans in https://github.com/nats-io/nats.rs/pull/1495
+* Switch to rustls-pki-types by @Jarema in https://github.com/nats-io/nats.rs/pull/1492
+* Tidy-up `async-nats/src/service/mod.rs` by @vkolomeyko in https://github.com/nats-io/nats.rs/pull/1487
+* Make some consumer/stream config accept `omitempty` case by @Jarema in https://github.com/nats-io/nats.rs/pull/1493
+* Improve the `drain` docs for better clarity by @Jarema in https://github.com/nats-io/nats.rs/pull/1484
+
+## New Contributors
+* @vkolomeyko made their first contribution in https://github.com/nats-io/nats.rs/pull/1489
+* @LouiseSianEvans made their first contribution in https://github.com/nats-io/nats.rs/pull/1495
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.45.0...async-nats/v0.46.0
+
+# v0.45.0
+## Overview
+
+A smaller release adding missing `value` field to `pub_ack` and some additional fixes.
+
+## Added
+* Add pub ack `value` field by @Jarema in https://github.com/nats-io/nats.rs/pull/1473
+* Add `double_ack_with` method to JetStream Messages by @OtaK in https://github.com/nats-io/nats.rs/pull/1474
+
+## Fixed
+* Fix object store headers serde by @Jarema in https://github.com/nats-io/nats.rs/pull/1472
+* Fix Kv limit markers in watches by @Jarema in https://github.com/nats-io/nats.rs/pull/1475
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.44.2...async-nats/v0.45.0
+
+
+# v0.44.2
+## Overview
+This PR adds a new method to Context traits and fixes the docs build
+
+## What's Changed
+* Add send_request method to JetStream Context by @Jarema in https://github.com/nats-io/nats.rs/pull/1466
+* Fix docs by @Jarema in https://github.com/nats-io/nats.rs/pull/1468
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.44.1...async-nats/v0.44.2
+
+# v0.44.1
+## What's Changed
+* Add missing errors types by @Jarema in https://github.com/nats-io/nats.rs/pull/1464
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.44.0...async-nats/v0.44.1
+
+# v0.44.0
+## Overview
+A release that focuses on reorganization of types and improvement of extension traits for [orbit](https://github.com/synadia-io/orbit.rs)
+
+## What's Changed
+* Enable service API by default by @Jarema in https://github.com/nats-io/nats.rs/pull/1461
+* Extend client traits by @Jarema in https://github.com/nats-io/nats.rs/pull/1456
+* Reorganize `message` types by @Jarema in https://github.com/nats-io/nats.rs/pull/1462
+
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.43.1...async-nats/v0.44.0
+
+# v0.43.1
+
+## Overview
+
+A hotfix for bugs and regressions introduced with recent release.
+
+## Fixed
+* Fix direct get with nats-server 2.11 & improve testing against older servers by @Jarema in https://github.com/nats-io/nats.rs/pull/1458
+* Properly handle acker cleanup by @Jarema in https://github.com/nats-io/nats.rs/pull/1460
+
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.43.0...async-nats/v0.43.13.0
+
+## Overview
+
+This release adds support for 2.12 server features and adds JetStream backpressure control to publishing.
+
+## Added
+* Add `allow_atomic_publish` by @Jarema in https://github.com/nats-io/nats.rs/pull/1448
+* Add prioritized PriorityPolicy by @Jarema in https://github.com/nats-io/nats.rs/pull/1440
+* Add messages counters stream config by @Jarema in https://github.com/nats-io/nats.rs/pull/1453
+* Add messages schedules stream config field by @Jarema in https://github.com/nats-io/nats.rs/pull/1452
+* Add peristence mode to the stream config by @Jarema in https://github.com/nats-io/nats.rs/pull/1449
+* Add new fields to `ClusterInfo` by @Jarema in https://github.com/nats-io/nats.rs/pull/1439
+* Add more fields to ServerInfo by @OtaK in https://github.com/nats-io/nats.rs/pull/1434
+* Add backpressure to publish by @Jarema in https://github.com/nats-io/nats.rs/pull/1286
+* Add port/path support for WebSockets by @AleTopp in https://github.com/nats-io/nats.rs/pull/1426
+* Add test to confirm user can promote mirror to a stream by @Jarema in https://github.com/nats-io/nats.rs/pull/1438
+* Add Direct get builder by @Jarema in https://github.com/nats-io/nats.rs/pull/1442
+* Add TryFrom<Bytes> support for subject by @Sibz in https://github.com/nats-io/nats.rs/pull/1390
+
+## Fixed
+* Fix linter issues by @Jarema in https://github.com/nats-io/nats.rs/pull/1427
+* Improve push ordered consumer by @Jarema in https://github.com/nats-io/nats.rs/pull/1445
+
+## Changed
+* Expose get_info for consumer by @nitsky in https://github.com/nats-io/nats.rs/pull/1428
+* Make errors methods public by @Jarema in https://github.com/nats-io/nats.rs/pull/1431
+* Replace futures by futures-util by @Totodore in https://github.com/nats-io/nats.rs/pull/1424
+
+## New Contributors
+* @nitsky made their first contribution in https://github.com/nats-io/nats.rs/pull/1428
+* @AleTopp made their first contribution in https://github.com/nats-io/nats.rs/pull/1426
+* @Sibz made their first contribution in https://github.com/nats-io/nats.rs/pull/1390
+* @OtaK made their first contribution in https://github.com/nats-io/nats.rs/pull/1434
+* @Totodore made their first contribution in https://github.com/nats-io/nats.rs/pull/1424
+
+**Full Changelog**: https://github.com/nats-io/nats.rs/compare/async-nats/v0.42.0...async-nats/v0.43.0
+
 # v0.42.0
 
 This releases focuses on some fixes and addition of Client traits that allow for easier extension of the client.

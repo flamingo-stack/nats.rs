@@ -22,12 +22,12 @@ use std::{
     time::Duration,
 };
 
+use crate::datetime::DateTime;
 use crate::HeaderValue;
 use bytes::Bytes;
-use futures_util::StreamExt;
-use once_cell::sync::Lazy;
+use futures_util::{future::BoxFuture, FutureExt, StreamExt};
 use regex::Regex;
-use time::OffsetDateTime;
+use std::sync::LazyLock;
 use tracing::debug;
 
 use crate::error::Error;
@@ -36,7 +36,7 @@ use crate::header;
 use self::bucket::Status;
 
 use super::{
-    consumer::{push::OrderedError, DeliverPolicy, StreamError, StreamErrorKind},
+    consumer::{self, push::OrderedError, DeliverPolicy, StreamError, StreamErrorKind},
     context::{PublishError, PublishErrorKind},
     message::StreamMessage,
     stream::{
@@ -73,13 +73,24 @@ fn kv_operation_from_message(message: &crate::message::Message) -> Result<Operat
     if let Some(op) = headers.get(KV_OPERATION) {
         Operation::from_str(op.as_str())
             .map_err(|err| EntryError::with_source(EntryErrorKind::Other, err))
+    } else if let Some(reason) = headers.get(header::NATS_MARKER_REASON) {
+        match reason.as_str() {
+            "MaxAge" | "Purge" => Ok(Operation::Purge),
+            "Remove" => Ok(Operation::Delete),
+            _ => Err(EntryError::with_source(
+                EntryErrorKind::Other,
+                "invalid marker reason",
+            )),
+        }
     } else {
         Ok(Operation::Put)
     }
 }
 
-static VALID_BUCKET_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\A[a-zA-Z0-9_-]+\z").unwrap());
-static VALID_KEY_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\A[-/_=\.a-zA-Z0-9]+\z").unwrap());
+static VALID_BUCKET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\A[a-zA-Z0-9_-]+\z").unwrap());
+static VALID_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\A[-/_=\.a-zA-Z0-9]+\z").unwrap());
 
 pub(crate) const MAX_HISTORY: i64 = 64;
 const ALL_KEYS: &str = ">";
@@ -89,7 +100,7 @@ const KV_OPERATION_DELETE: &str = "DEL";
 const KV_OPERATION_PURGE: &str = "PURGE";
 const KV_OPERATION_PUT: &str = "PUT";
 
-const NATS_ROLLUP: &str = "Nats-Rollup";
+use crate::header::NATS_ROLLUP;
 const ROLLUP_SUBJECT: &str = "sub";
 
 pub(crate) fn is_valid_bucket_name(bucket_name: &str) -> bool {
@@ -385,7 +396,7 @@ impl Store {
             return Err(EntryError::new(EntryErrorKind::InvalidKey));
         }
 
-        let subject = format!("{}{}", self.prefix.as_str(), &key);
+        let subject = format!("{}{}", self.prefix.as_str(), key);
 
         let result: Option<(StreamMessage, Operation)> = {
             if self.stream.info.config.allow_direct {
@@ -1207,8 +1218,8 @@ impl Store {
         subject.push_str(key.as_ref());
 
         let mut headers = crate::HeaderMap::default();
-        headers.insert(KV_OPERATION, HeaderValue::from(KV_OPERATION_PURGE));
-        headers.insert(NATS_ROLLUP, HeaderValue::from(ROLLUP_SUBJECT));
+        headers.insert(KV_OPERATION, KV_OPERATION_PURGE);
+        headers.insert(NATS_ROLLUP, ROLLUP_SUBJECT);
         if let Some(ttl) = ttl {
             headers.insert(header::NATS_MESSAGE_TTL, HeaderValue::from(ttl.as_secs()));
         }
@@ -1271,10 +1282,12 @@ impl Store {
             .await?;
 
         Ok(History {
+            done: consumer.info.num_pending == 0,
             subscription: consumer.messages().await?,
-            done: false,
             prefix: self.prefix.clone(),
             bucket: self.name.clone(),
+            checked_heartbeats: 0,
+            delivered_all: None,
         })
     }
 
@@ -1347,6 +1360,8 @@ impl Store {
             subscription: consumer.messages().await?,
             prefix: self.prefix.clone(),
             bucket: self.name.clone(),
+            checked_heartbeats: 0,
+            delivered_all: None,
         };
 
         Ok(Keys { inner: entries })
@@ -1420,6 +1435,10 @@ pub struct History {
     done: bool,
     prefix: String,
     bucket: String,
+    /// Idle heartbeats already followed by a check whether everything was delivered.
+    checked_heartbeats: u64,
+    /// In-flight consumer info request for that check.
+    delivered_all: Option<BoxFuture<'static, Result<consumer::Info, crate::Error>>>,
 }
 
 impl futures_util::Stream for History {
@@ -1429,50 +1448,85 @@ impl futures_util::Stream for History {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        if self.done {
-            return Poll::Ready(None);
-        }
-        match self.subscription.poll_next_unpin(cx) {
-            Poll::Ready(message) => match message {
-                None => Poll::Ready(None),
-                Some(message) => {
-                    let message = message?;
-                    let info = message.info().map_err(|err| {
-                        WatcherError::with_source(
-                            WatcherErrorKind::Other,
-                            format!("failed to parse message metadata: {err}"),
-                        )
-                    })?;
-                    if info.pending == 0 {
+        loop {
+            if self.done {
+                return Poll::Ready(None);
+            }
+            match self.subscription.poll_next_unpin(cx) {
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(message)) => return Poll::Ready(Some(self.entry(message))),
+                Poll::Pending => {}
+            }
+
+            // The pending count taken when the consumer was created can go stale: entries may be
+            // removed (max_age, purge) before they are delivered, and then no entry with
+            // `pending == 0` ever arrives. After each idle heartbeat, ask the server whether the
+            // consumer has anything left to deliver.
+            if self.delivered_all.is_none()
+                && self.subscription.idle_heartbeats() > self.checked_heartbeats
+            {
+                self.checked_heartbeats = self.subscription.idle_heartbeats();
+                self.delivered_all = Some(self.subscription.consumer_info());
+            }
+            let Some(check) = self.delivered_all.as_mut() else {
+                return Poll::Pending;
+            };
+            match check.poll_unpin(cx) {
+                Poll::Ready(Ok(info)) => {
+                    self.delivered_all = None;
+                    if self.subscription.delivered_all(&info) {
                         self.done = true;
                     }
-
-                    let operation = kv_operation_from_message(&message).unwrap_or(Operation::Put);
-
-                    let key = message
-                        .subject
-                        .strip_prefix(&self.prefix)
-                        .map(|s| s.to_string())
-                        .unwrap();
-
-                    Poll::Ready(Some(Ok(Entry {
-                        bucket: self.bucket.clone(),
-                        key,
-                        value: message.payload.clone(),
-                        revision: info.stream_sequence,
-                        created: info.published,
-                        delta: info.pending,
-                        operation,
-                        seen_current: self.done,
-                    })))
                 }
-            },
-            std::task::Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(err)) => {
+                    // Checked again on the next idle heartbeat.
+                    debug!("failed to check if history was fully delivered: {err}");
+                    self.delivered_all = None;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         (0, None)
+    }
+}
+
+impl History {
+    fn entry(
+        &mut self,
+        message: Result<crate::jetstream::Message, OrderedError>,
+    ) -> Result<Entry, WatcherError> {
+        let message = message?;
+        let info = message.info().map_err(|err| {
+            WatcherError::with_source(
+                WatcherErrorKind::Other,
+                format!("failed to parse message metadata: {err}"),
+            )
+        })?;
+        if info.pending == 0 {
+            self.done = true;
+        }
+
+        let operation = kv_operation_from_message(&message).unwrap_or(Operation::Put);
+
+        let key = message
+            .subject
+            .strip_prefix(&self.prefix)
+            .map(|s| s.to_string())
+            .unwrap();
+
+        Ok(Entry {
+            bucket: self.bucket.clone(),
+            key,
+            value: message.payload.clone(),
+            revision: info.stream_sequence,
+            created: info.published,
+            delta: info.pending,
+            operation,
+            seen_current: self.done,
+        })
     }
 }
 
@@ -1522,7 +1576,7 @@ pub struct Entry {
     /// Distance from the latest value.
     pub delta: u64,
     /// The time the data was put in the bucket.
-    pub created: OffsetDateTime,
+    pub created: DateTime,
     /// The kind of operation that caused this entry.
     pub operation: Operation,
     /// Set to true after all historical messages have been received, and
@@ -1559,10 +1613,14 @@ pub enum CreateErrorKind {
 impl From<UpdateError> for CreateError {
     fn from(error: UpdateError) -> Self {
         match error.kind() {
-            UpdateErrorKind::InvalidKey => Error::from(CreateErrorKind::InvalidKey),
-            UpdateErrorKind::TimedOut => Error::from(CreateErrorKind::Publish),
-            UpdateErrorKind::WrongLastRevision => Error::from(CreateErrorKind::AlreadyExists),
-            UpdateErrorKind::Other => Error::from(CreateErrorKind::Other),
+            UpdateErrorKind::InvalidKey => {
+                CreateError::with_source(CreateErrorKind::InvalidKey, error)
+            }
+            UpdateErrorKind::TimedOut => CreateError::with_source(CreateErrorKind::Publish, error),
+            UpdateErrorKind::WrongLastRevision => {
+                CreateError::with_source(CreateErrorKind::AlreadyExists, error)
+            }
+            UpdateErrorKind::Other => CreateError::with_source(CreateErrorKind::Other, error),
         }
     }
 }
@@ -1570,9 +1628,11 @@ impl From<UpdateError> for CreateError {
 impl From<PutError> for CreateError {
     fn from(error: PutError) -> Self {
         match error.kind() {
-            PutErrorKind::InvalidKey => Error::from(CreateErrorKind::InvalidKey),
-            PutErrorKind::Publish => Error::from(CreateErrorKind::Publish),
-            PutErrorKind::Ack => Error::from(CreateErrorKind::Ack),
+            PutErrorKind::InvalidKey => {
+                CreateError::with_source(CreateErrorKind::InvalidKey, error)
+            }
+            PutErrorKind::Publish => CreateError::with_source(CreateErrorKind::Publish, error),
+            PutErrorKind::Ack => CreateError::with_source(CreateErrorKind::Ack, error),
         }
     }
 }
@@ -1580,9 +1640,11 @@ impl From<PutError> for CreateError {
 impl From<EntryError> for CreateError {
     fn from(error: EntryError) -> Self {
         match error.kind() {
-            EntryErrorKind::InvalidKey => Error::from(CreateErrorKind::InvalidKey),
-            EntryErrorKind::TimedOut => Error::from(CreateErrorKind::Publish),
-            EntryErrorKind::Other => Error::from(CreateErrorKind::Other),
+            EntryErrorKind::InvalidKey => {
+                CreateError::with_source(CreateErrorKind::InvalidKey, error)
+            }
+            EntryErrorKind::TimedOut => CreateError::with_source(CreateErrorKind::Publish, error),
+            EntryErrorKind::Other => CreateError::with_source(CreateErrorKind::Other, error),
         }
     }
 }

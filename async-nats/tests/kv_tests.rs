@@ -11,8 +11,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "kv")]
 mod kv {
-    use std::{collections::HashMap, str::from_utf8, time::Duration};
+    use std::{collections::HashMap, error::Error, str::from_utf8, time::Duration};
 
     use async_nats::{
         jetstream::{
@@ -82,6 +83,10 @@ mod kv {
 
         let create = kv.create("key", payload.clone()).await;
         assert!(create.is_err());
+        assert_eq!(
+            create.as_ref().unwrap_err().kind(),
+            async_nats::jetstream::kv::CreateErrorKind::AlreadyExists
+        );
 
         kv.delete("key").await.unwrap();
         let create = kv.create("key", payload.clone()).await;
@@ -90,6 +95,42 @@ mod kv {
         kv.purge("key").await.unwrap();
         let create = kv.create("key", payload.clone()).await;
         assert!(create.is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_with_failure() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = ConnectOptions::new()
+            .event_callback(|event| async move { println!("event: {event:?}") })
+            .connect(server.client_url())
+            .await
+            .unwrap();
+
+        let context = async_nats::jetstream::new(client);
+
+        let kv = context
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: "test".into(),
+                description: "test_description".into(),
+                history: 10,
+                storage: StorageType::File,
+                num_replicas: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let payload: Bytes = "data".into();
+
+        let create = kv.create("", payload.clone()).await;
+        assert!(create.is_err());
+        assert_eq!(
+            create.as_ref().unwrap_err().kind(),
+            async_nats::jetstream::kv::CreateErrorKind::InvalidKey
+        );
+        // Verify the source error contains the expected message
+        let source = create.as_ref().unwrap_err().source().unwrap();
+        assert!(source.to_string().contains("key cannot be empty"));
     }
 
     #[tokio::test]
@@ -1101,22 +1142,228 @@ mod kv {
             .unwrap();
 
         kv.put("baz", "value".into()).await.unwrap();
-        tryhard::retry_fn(|| async {
-            match kv.keys().await {
-                Ok(keys) => {
-                    let keys = keys.try_collect::<Vec<String>>().await.unwrap();
-                    if !keys.is_empty() {
-                        return Err("keys not empty".into());
-                    }
-                    Ok::<(), async_nats::Error>(())
-                }
-                Err(e) => Err(e.into()),
+
+        // Wait for max_age to remove the entry before listing, so the result does not depend on
+        // whether expiry wins a race against `keys()`.
+        let mut stream = context.get_stream("KV_history2").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stream.info().await.unwrap().state.messages > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
-        .retries(5)
-        .exponential_backoff(Duration::from_millis(100))
         .await
+        .expect("entry did not expire");
+
+        let keys = kv
+            .keys()
+            .await
+            .unwrap()
+            .try_collect::<Vec<String>>()
+            .await
+            .unwrap();
+        assert!(keys.is_empty(), "expired key listed: {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn history_of_missing_key_is_empty() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = async_nats::connect(server.client_url()).await.unwrap();
+        let context = async_nats::jetstream::new(client);
+
+        let kv = context
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: "history".into(),
+                history: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        kv.put("present", "value".into()).await.unwrap();
+
+        let history = tokio::time::timeout(Duration::from_secs(2), async {
+            kv.history("missing")
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await
+        .expect("history of a missing key never finished")
         .unwrap();
+        assert!(history.is_empty());
+    }
+
+    // `keys()` sees one pending entry when it creates its consumer, but the entry is removed
+    // (as by max_age expiry) before it is delivered. The listing must still finish.
+    #[tokio::test]
+    async fn keys_entry_removed_before_delivery() {
+        let (_server, context, proxy) = pending_entry_removed_setup("removed").await;
+        let kv = context.get_key_value("removed").await.unwrap();
+
+        let keys =
+            tokio::spawn(
+                async move { kv.keys().await.unwrap().try_collect::<Vec<String>>().await },
+            );
+        proxy.remove_entries_before_delivery("KV_removed").await;
+
+        let keys = tokio::time::timeout(Duration::from_secs(20), keys)
+            .await
+            .expect("keys() never finished")
+            .unwrap()
+            .unwrap();
+        assert!(keys.is_empty(), "removed key listed: {keys:?}");
+    }
+
+    // Same as `keys_entry_removed_before_delivery`, for `history()`.
+    #[tokio::test]
+    async fn history_entry_removed_before_delivery() {
+        let (_server, context, proxy) = pending_entry_removed_setup("removed").await;
+        let kv = context.get_key_value("removed").await.unwrap();
+
+        let history = tokio::spawn(async move {
+            kv.history("key")
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+        });
+        proxy.remove_entries_before_delivery("KV_removed").await;
+
+        let history = tokio::time::timeout(Duration::from_secs(20), history)
+            .await
+            .expect("history() never finished")
+            .unwrap()
+            .unwrap();
+        assert!(history.is_empty(), "removed entry returned: {history:?}");
+    }
+
+    /// Creates bucket `bucket` holding one entry, and a JetStream context whose connection goes
+    /// through a [`SubHoldingProxy`].
+    async fn pending_entry_removed_setup(
+        bucket: &str,
+    ) -> (
+        nats_server::Server,
+        async_nats::jetstream::Context,
+        SubHoldingProxy,
+    ) {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let admin = async_nats::connect(server.client_url()).await.unwrap();
+        let admin = async_nats::jetstream::new(admin);
+        admin
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: bucket.into(),
+                history: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .put("key", "value".into())
+            .await
+            .unwrap();
+
+        let proxy = SubHoldingProxy::start(server.client_port(), admin).await;
+        let client = async_nats::connect(format!("nats://127.0.0.1:{}", proxy.port))
+            .await
+            .unwrap();
+        (server, async_nats::jetstream::new(client), proxy)
+    }
+
+    /// TCP proxy that holds the client's first `SUB` after a consumer create request until told
+    /// to continue. The consumer then exists on the server, but nothing can be delivered to it.
+    struct SubHoldingProxy {
+        port: u16,
+        admin: async_nats::jetstream::Context,
+        held: tokio::sync::oneshot::Receiver<()>,
+        release: tokio::sync::oneshot::Sender<()>,
+    }
+
+    impl SubHoldingProxy {
+        async fn start(server_port: u16, admin: async_nats::jetstream::Context) -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+            // Bind the wildcard address: a listener on 127.0.0.1 can share its port with a test
+            // server listening on the wildcard address, and would steal that server's clients.
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (held_tx, held) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+            tokio::spawn(async move {
+                let (downstream, _) = listener.accept().await.unwrap();
+                let upstream = tokio::net::TcpStream::connect(("127.0.0.1", server_port))
+                    .await
+                    .unwrap();
+                let (client_read, mut client_write) = downstream.into_split();
+                let (mut server_read, mut server_write) = upstream.into_split();
+                tokio::spawn(async move {
+                    tokio::io::copy(&mut server_read, &mut client_write)
+                        .await
+                        .ok();
+                });
+
+                let mut client_read = tokio::io::BufReader::new(client_read);
+                let mut held_tx = Some(held_tx);
+                let mut release_rx = Some(release_rx);
+                let mut consumer_created = false;
+                loop {
+                    let mut op = Vec::new();
+                    if client_read.read_until(b'\n', &mut op).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let line = String::from_utf8_lossy(&op).to_string();
+                    let mut tokens = line.split_whitespace();
+                    match tokens.next() {
+                        Some("PUB") | Some("HPUB") => {
+                            let tokens: Vec<&str> = tokens.collect();
+                            if tokens[0].starts_with("$JS.API.CONSUMER.CREATE.") {
+                                consumer_created = true;
+                            }
+                            let size: usize = tokens.last().unwrap().parse().unwrap();
+                            let mut payload = vec![0; size + 2];
+                            client_read.read_exact(&mut payload).await.unwrap();
+                            op.extend_from_slice(&payload);
+                        }
+                        Some("SUB") if consumer_created => {
+                            if let (Some(held_tx), Some(release_rx)) =
+                                (held_tx.take(), release_rx.take())
+                            {
+                                held_tx.send(()).ok();
+                                release_rx.await.ok();
+                            }
+                        }
+                        _ => {}
+                    }
+                    if server_write.write_all(&op).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            SubHoldingProxy {
+                port,
+                admin,
+                held,
+                release,
+            }
+        }
+
+        /// Waits until the consumer exists with its entries still pending, removes all entries
+        /// from `stream` without writing markers (as max_age expiry does), then lets the client
+        /// subscribe.
+        async fn remove_entries_before_delivery(self, stream: &str) {
+            tokio::time::timeout(Duration::from_secs(10), self.held)
+                .await
+                .expect("consumer was never created")
+                .unwrap();
+            self.admin
+                .get_stream(stream)
+                .await
+                .unwrap()
+                .purge()
+                .await
+                .unwrap();
+            self.release.send(()).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1484,6 +1731,65 @@ mod kv {
         assert_eq!(Operation::Purge, entry.operation);
     }
 
+    #[cfg(feature = "server_2_11")]
+    #[tokio::test]
+    async fn watch_with_limit_markers() {
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = ConnectOptions::new()
+            .connect(server.client_url())
+            .await
+            .unwrap();
+
+        let context = async_nats::jetstream::new(client);
+
+        // Create a bucket with a very short max_age to trigger automatic expiration
+        // and limit_markers enabled to generate marker messages
+        let kv = context
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: "maxage".into(),
+                description: "test maxage markers".into(),
+                history: 10,
+                max_age: Duration::from_millis(500),
+                storage: StorageType::File,
+                num_replicas: 1,
+                limit_markers: Some(Duration::from_secs(10)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Start watching all keys (this will watch for new updates)
+        let mut watcher = kv.watch_all().await.unwrap();
+
+        // Put a key that will age out
+        kv.put("expiring_key", "value".into()).await.unwrap();
+
+        // First entry should be the Put operation we just did
+        let entry = watcher.next().await.unwrap().unwrap();
+        assert_eq!(entry.key, "expiring_key");
+        assert_eq!(entry.operation, Operation::Put);
+        assert_eq!(entry.value.as_ref(), b"value");
+
+        // Wait for the key to age out - the server will emit a marker message
+        // We need to wait longer than max_age (500ms) for the server to process expiration
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // The next entry should be the MaxAge marker with Operation::Purge
+        // This is the key assertion - before the fix, this would be Operation::Put with empty payload
+        let entry = watcher.next().await.unwrap().unwrap();
+        assert_eq!(entry.key, "expiring_key");
+        assert_eq!(
+            entry.operation,
+            Operation::Purge,
+            "MaxAge marker should result in Operation::Purge, not Operation::Put"
+        );
+        assert_eq!(
+            entry.value.as_ref(),
+            b"",
+            "MaxAge marker should have empty payload"
+        );
+    }
+
     #[tokio::test]
     async fn create_or_update_key_value() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
@@ -1546,5 +1852,56 @@ mod kv {
             bucket.stream.cached_info().config.max_messages_per_subject,
             50
         );
+    }
+
+    #[tokio::test]
+    async fn test_direct_get_with_long_bucket_names() {
+        // Regression test for issue #1457
+        // Tests that KV get operations work correctly with long bucket names containing hyphens
+        // The issue was that direct_get_last_for_subject was sending a JSON payload when the subject
+        // was embedded in the URL, causing InvalidSubject errors
+        let server = nats_server::run_server("tests/configs/jetstream.conf");
+        let client = ConnectOptions::new()
+            .connect(server.client_url())
+            .await
+            .unwrap();
+
+        let context = async_nats::jetstream::new(client);
+
+        // Create KV bucket with a long name containing hyphens (as in the issue)
+        let bucket_name = "local-test-stream-rust-jetstream-bucket-local-test-cluster";
+        let store = context
+            .create_key_value(async_nats::jetstream::kv::Config {
+                bucket: bucket_name.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Use a key with hyphens as in the issue
+        let key = "local-test-stream-rust-key";
+        let value = "test_value_12345";
+
+        // PUT operation
+        store.put(key, value.into()).await.unwrap();
+
+        // Small delay to ensure write is propagated
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // GET operation - this would fail with InvalidSubject before the fix
+        let get_result = store.get(key).await;
+
+        match get_result {
+            Ok(Some(entry)) => {
+                let retrieved_value = String::from_utf8_lossy(&entry);
+                assert_eq!(retrieved_value, value, "Retrieved value doesn't match");
+            }
+            Ok(None) => {
+                panic!("Key not found, but we just put it!");
+            }
+            Err(e) => {
+                panic!("KV get failed with error: {:?}", e);
+            }
+        }
     }
 }

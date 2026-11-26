@@ -23,7 +23,7 @@ use base64::engine::general_purpose::URL_SAFE;
 use base64::engine::Engine;
 use bytes::BytesMut;
 use futures_util::future::BoxFuture;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use tokio::io::AsyncReadExt;
 
 use futures_util::{Stream, StreamExt};
@@ -36,15 +36,17 @@ use super::consumer::{DeliverPolicy, StreamError, StreamErrorKind};
 use super::context::{PublishError, PublishErrorKind};
 use super::stream::{self, ConsumerError, ConsumerErrorKind, PurgeError, PurgeErrorKind};
 use super::{consumer::push::Ordered, stream::StorageType};
+use crate::datetime::{self, rfc3339, DateTime};
 use crate::error::Error;
-use time::{serde::rfc3339, OffsetDateTime};
+use crate::header::NATS_ROLLUP;
 
 const DEFAULT_CHUNK_SIZE: usize = 128 * 1024;
-const NATS_ROLLUP: &str = "Nats-Rollup";
 const ROLLUP_SUBJECT: &str = "sub";
 
-static BUCKET_NAME_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\A[a-zA-Z0-9_-]+\z").unwrap());
-static OBJECT_NAME_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\A[-/_=\.a-zA-Z0-9]+\z").unwrap());
+static BUCKET_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\A[a-zA-Z0-9_-]+\z").unwrap());
+static OBJECT_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\A[-/_=\.a-zA-Z0-9]+\z").unwrap());
 
 pub(crate) fn is_valid_bucket_name(bucket_name: &str) -> bool {
     BUCKET_NAME_RE.is_match(bucket_name)
@@ -202,7 +204,7 @@ impl ObjectStore {
             })?,
         );
 
-        let subject = format!("$O.{}.M.{}", &self.name, encode_object_name(object_name));
+        let subject = format!("$O.{}.M.{}", self.name, encode_object_name(object_name));
 
         self.stream
             .context
@@ -240,26 +242,36 @@ impl ObjectStore {
         }
 
         // Grab last meta value we have.
-        let subject = format!("$O.{}.M.{}", &self.name, &object_name);
+        let subject = format!("$O.{}.M.{}", self.name, object_name);
 
-        // FIXME(jrm): we should use direct get here when possible.
-        let message = self
-            .stream
-            .get_last_raw_message_by_subject(subject.as_str())
-            .await
-            .map_err(|err| match err.kind() {
-                stream::LastRawMessageErrorKind::NoMessageFound => {
-                    InfoError::new(InfoErrorKind::NotFound)
-                }
-                _ => InfoError::with_source(InfoErrorKind::Other, err),
-            })?;
-        let object_info =
-            serde_json::from_slice::<ObjectInfo>(&message.payload).map_err(|err| {
-                InfoError::with_source(
-                    InfoErrorKind::Other,
-                    format!("failed to decode info payload: {err}"),
-                )
-            })?;
+        let payload = if self.stream.info.config.allow_direct {
+            self.stream
+                .direct_get_last_for_subject(subject.as_str())
+                .await
+                .map(|message| message.payload)
+                .map_err(|err| match err.kind() {
+                    stream::DirectGetErrorKind::NotFound => InfoError::new(InfoErrorKind::NotFound),
+                    stream::DirectGetErrorKind::TimedOut => InfoError::new(InfoErrorKind::TimedOut),
+                    _ => InfoError::with_source(InfoErrorKind::Other, err),
+                })?
+        } else {
+            self.stream
+                .get_last_raw_message_by_subject(subject.as_str())
+                .await
+                .map(|message| message.payload)
+                .map_err(|err| match err.kind() {
+                    stream::LastRawMessageErrorKind::NoMessageFound => {
+                        InfoError::new(InfoErrorKind::NotFound)
+                    }
+                    _ => InfoError::with_source(InfoErrorKind::Other, err),
+                })?
+        };
+        let object_info = serde_json::from_slice::<ObjectInfo>(&payload).map_err(|err| {
+            InfoError::with_source(
+                InfoErrorKind::Other,
+                format!("failed to decode info payload: {err}"),
+            )
+        })?;
 
         Ok(object_info)
     }
@@ -294,8 +306,8 @@ impl ObjectStore {
         // Fetch any existing object info, if there is any for later use.
         let maybe_existing_object_info = (self.info(&object_meta.name).await).ok();
 
-        let object_nuid = nuid::next();
-        let chunk_subject = Subject::from(format!("$O.{}.C.{}", &self.name, &object_nuid));
+        let object_nuid = crate::id_generator::next();
+        let chunk_subject = Subject::from(format!("$O.{}.C.{}", self.name, object_nuid));
 
         let mut object_chunks = 0;
         let mut object_size = 0;
@@ -344,7 +356,7 @@ impl ObjectStore {
         if !is_valid_object_name(&encoded_object_name) {
             return Err(PutError::new(PutErrorKind::InvalidName));
         }
-        let subject = format!("$O.{}.M.{}", &self.name, &encoded_object_name);
+        let subject = format!("$O.{}.M.{}", self.name, encoded_object_name);
 
         let object_info = ObjectInfo {
             name: object_meta.name,
@@ -358,7 +370,7 @@ impl ObjectStore {
             chunks: object_chunks,
             size: object_size,
             digest: Some(format!("SHA-256={}", URL_SAFE.encode(digest))),
-            modified: Some(OffsetDateTime::now_utc()),
+            modified: Some(datetime::now()),
             deleted: false,
             metadata: object_meta.metadata,
             headers: object_meta.headers,
@@ -399,7 +411,7 @@ impl ObjectStore {
 
         // Purge any old chunks.
         if let Some(existing_object_info) = maybe_existing_object_info {
-            let chunk_subject = format!("$O.{}.C.{}", &self.name, &existing_object_info.nuid);
+            let chunk_subject = format!("$O.{}.C.{}", self.name, existing_object_info.nuid);
 
             self.stream
                 .purge()
@@ -610,7 +622,7 @@ impl ObjectStore {
         info.description = metadata.description;
 
         let name = encode_object_name(&info.name);
-        let subject = format!("$O.{}.M.{}", &self.name, &name);
+        let subject = format!("$O.{}.M.{}", self.name, name);
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -718,10 +730,10 @@ impl ObjectStore {
                 max_chunk_size: None,
             }),
             bucket: self.name.clone(),
-            nuid: nuid::next().to_string(),
+            nuid: crate::id_generator::next(),
             size: 0,
             chunks: 0,
-            modified: Some(OffsetDateTime::now_utc()),
+            modified: Some(datetime::now()),
             digest: None,
             deleted: false,
             metadata: HashMap::default(),
@@ -783,10 +795,10 @@ impl ObjectStore {
                 max_chunk_size: None,
             }),
             bucket: self.name.clone(),
-            nuid: nuid::next().to_string(),
+            nuid: crate::id_generator::next(),
             size: 0,
             chunks: 0,
-            modified: Some(OffsetDateTime::now_utc()),
+            modified: Some(datetime::now()),
             digest: None,
             deleted: false,
             metadata: HashMap::default(),
@@ -799,7 +811,7 @@ impl ObjectStore {
 
 async fn publish_meta(store: &ObjectStore, info: &ObjectInfo) -> Result<(), PublishMetadataError> {
     let encoded_object_name = encode_object_name(&info.name);
-    let subject = format!("$O.{}.M.{}", &store.name, &encoded_object_name);
+    let subject = format!("$O.{}.M.{}", store.name, encoded_object_name);
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -980,31 +992,42 @@ impl tokio::io::AsyncRead for Object {
 
         if self.has_pending_messages {
             if self.subscription.is_none() {
-                let future = match self.subscription_future.as_mut() {
-                    Some(future) => future,
-                    None => {
-                        let stream = self.stream.clone();
-                        let bucket = self.info.bucket.clone();
-                        let nuid = self.info.nuid.clone();
-                        self.subscription_future.insert(Box::pin(async move {
-                            stream
-                                .create_consumer(OrderedConfig {
-                                    deliver_subject: stream.context.client.new_inbox(),
-                                    filter_subject: format!("$O.{bucket}.C.{nuid}"),
-                                    ..Default::default()
-                                })
-                                .await
-                                .unwrap()
-                                .messages()
-                                .await
-                        }))
-                    }
-                };
+                // Take the future out and put it back only while pending: a finished
+                // future must not be polled again on a retried read.
+                let mut future: BoxFuture<'static, Result<Ordered, StreamError>> =
+                    match self.subscription_future.take() {
+                        Some(future) => future,
+                        None => {
+                            let stream = self.stream.clone();
+                            let bucket = self.info.bucket.clone();
+                            let nuid = self.info.nuid.clone();
+                            Box::pin(async move {
+                                stream
+                                    .create_consumer(OrderedConfig {
+                                        deliver_subject: stream.context.client.new_inbox(),
+                                        filter_subject: format!("$O.{bucket}.C.{nuid}"),
+                                        ..Default::default()
+                                    })
+                                    .await?
+                                    .messages()
+                                    .await
+                            })
+                        }
+                    };
                 match future.as_mut().poll(cx) {
                     Poll::Ready(subscription) => {
-                        self.subscription = Some(subscription.unwrap());
+                        // Keep the timeout kind visible through the `io::Error`.
+                        self.subscription = Some(subscription.map_err(|err| {
+                            let kind = match err.kind() {
+                                StreamErrorKind::TimedOut => std::io::ErrorKind::TimedOut,
+                                _ => std::io::ErrorKind::Other,
+                            };
+                            std::io::Error::new(kind, err)
+                        })?);
                     }
-                    Poll::Pending => (),
+                    Poll::Pending => {
+                        self.subscription_future = Some(future);
+                    }
                 }
             }
             if let Some(subscription) = self.subscription.as_mut() {
@@ -1109,7 +1132,7 @@ pub struct ObjectInfo {
     /// Date and time the object was last modified.
     #[serde(default, with = "rfc3339::option")]
     #[serde(rename = "mtime")]
-    pub modified: Option<time::OffsetDateTime>,
+    pub modified: Option<DateTime>,
     /// Digest of the object stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
