@@ -98,6 +98,9 @@ pub struct ConnectOptions {
     pub(crate) reconnect_to_server_callback: Option<ReconnectToServerCallback>,
     pub(crate) auth_url_callback: Option<CallbackArg1<(), Result<String, AuthError>>>,
     pub(crate) handshake_headers: HashMap<String, String>,
+    #[cfg(feature = "websockets")]
+    pub(crate) websocket_headers_callback:
+        Option<CallbackArg1<(), Result<http::HeaderMap, AuthError>>>,
 }
 
 impl fmt::Debug for ConnectOptions {
@@ -169,6 +172,8 @@ impl Default for ConnectOptions {
             reconnect_to_server_callback: None,
             auth_url_callback: None,
             handshake_headers: HashMap::new(),
+            #[cfg(feature = "websockets")]
+            websocket_headers_callback: None,
         }
     }
 }
@@ -1250,6 +1255,42 @@ impl ConnectOptions {
     {
         self.handshake_headers
             .insert(name.to_string(), value.to_string());
+        self
+    }
+
+    /// Sets a callback that returns HTTP headers for the WebSocket upgrade request of `ws://`
+    /// and `wss://` connections. It is called on every connection attempt, reconnects
+    /// included, so short-lived credentials such as a rotating bearer token stay fresh.
+    /// Its headers are added after those of [`custom_header`](ConnectOptions::custom_header)
+    /// and replace one with the same name. If the callback fails, or returns a header the
+    /// WebSocket handshake sets itself, the attempt fails and the client retries as usual.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// use async_nats::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
+    ///
+    /// async_nats::ConnectOptions::new()
+    ///     .websocket_headers_callback(|| async move {
+    ///         // Get a fresh token from your auth service.
+    ///         let mut headers = HeaderMap::new();
+    ///         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer my-token"));
+    ///         Ok(headers)
+    ///     })
+    ///     .connect("wss://nats.example.com/ws")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "websockets")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "websockets")))]
+    pub fn websocket_headers_callback<F, Fut>(mut self, cb: F) -> ConnectOptions
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<http::HeaderMap, AuthError>> + Send + Sync + 'static,
+    {
+        self.websocket_headers_callback = Some(CallbackArg1(Arc::new(move |()| Box::pin(cb()))));
         self
     }
 }
