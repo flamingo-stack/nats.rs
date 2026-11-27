@@ -18,6 +18,7 @@ mod websockets {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use async_nats::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
     use async_nats::{AuthError, ClientError, ConnectErrorKind, Event};
     use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -207,6 +208,85 @@ mod websockets {
             assert_eq!(
                 next(&mut events).await,
                 Event::ClientError(ClientError::Other("authorization violation".into()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_headers_callback_runs_on_every_upgrade() {
+        let (url, mut requests) = reject_upgrades().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .custom_header("x-machine-id", "machine-1")
+            .custom_header("x-tenant", "from-custom-header")
+            .websocket_headers_callback({
+                let calls = calls.clone();
+                move || {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        let mut headers = HeaderMap::new();
+                        let token = HeaderValue::from_str(&format!("Bearer token-{n}")).unwrap();
+                        headers.insert(AUTHORIZATION, token);
+                        headers.insert("x-tenant", HeaderValue::from_static("from-callback"));
+                        Ok(headers)
+                    }
+                }
+            })
+            .connect(url)
+            .await
+            .unwrap();
+
+        for n in 1..=2 {
+            let request = next(&mut requests).await.to_lowercase();
+            assert!(
+                request.contains(&format!("\r\nauthorization: bearer token-{n}\r\n")),
+                "{request}"
+            );
+            assert!(
+                request.contains("\r\nx-machine-id: machine-1\r\n"),
+                "{request}"
+            );
+            assert!(
+                request.contains("\r\nx-tenant: from-callback\r\n"),
+                "{request}"
+            );
+            assert!(!request.contains("from-custom-header"), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_websocket_headers_callback_reports_the_error_and_retries() {
+        let (url, mut requests) = reject_upgrades().await;
+        let (on_event, mut events) = events();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .event_callback(on_event)
+            .websocket_headers_callback({
+                let calls = calls.clone();
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Err(AuthError::new("no token")) }
+                }
+            })
+            .connect(url)
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                next(&mut events).await,
+                Event::ClientError(ClientError::Other(
+                    ConnectErrorKind::Authentication.to_string()
+                ))
+            );
+        }
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        while let Ok(request) = requests.try_recv() {
+            assert!(
+                !request.to_lowercase().contains("authorization"),
+                "{request}"
             );
         }
     }

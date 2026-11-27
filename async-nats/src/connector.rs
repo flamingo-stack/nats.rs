@@ -168,6 +168,9 @@ pub(crate) struct ConnectorOptions {
     pub(crate) auth_url_callback: Option<CallbackArg1<(), Result<String, AuthError>>>,
     #[cfg_attr(not(feature = "websockets"), allow(dead_code))]
     pub(crate) handshake_headers: HashMap<String, String>,
+    #[cfg(feature = "websockets")]
+    pub(crate) websocket_headers_callback:
+        Option<CallbackArg1<(), Result<http::HeaderMap, AuthError>>>,
 }
 
 /// Maintains a list of servers and establishes connections.
@@ -1351,6 +1354,16 @@ impl Connector {
                         _ => tracing::warn!(header = %name, "skipping invalid handshake header"),
                     }
                 }
+                if let Some(callback) = &self.options.websocket_headers_callback {
+                    let headers = callback.call(()).await.map_err(|err| {
+                        ConnectError::with_source(ConnectErrorKind::Authentication, err)
+                    })?;
+                    for (name, value) in &headers {
+                        builder = builder
+                            .add_header(name.clone(), value.clone())
+                            .map_err(|err| ConnectError::with_source(ConnectErrorKind::Io, err))?;
+                    }
+                }
                 let ws = builder.connect_on(stream).await.map_err(|err| {
                     // A gateway in front of the server rejects credentials with HTTP 401.
                     let kind = if matches!(
@@ -1676,6 +1689,8 @@ mod tests {
             reconnect_to_server_callback: None,
             auth_url_callback: None,
             handshake_headers: HashMap::new(),
+            #[cfg(feature = "websockets")]
+            websocket_headers_callback: None,
         }
     }
 
