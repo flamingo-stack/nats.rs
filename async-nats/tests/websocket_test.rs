@@ -18,7 +18,10 @@ mod websockets {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use async_nats::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
+    use async_nats::http::{
+        header::{AUTHORIZATION, HOST},
+        HeaderMap, HeaderValue,
+    };
     use async_nats::{AuthError, ClientError, ConnectErrorKind, Event};
     use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -288,6 +291,27 @@ mod websockets {
                 !request.to_lowercase().contains("authorization"),
                 "{request}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_header_the_handshake_sets_fails_the_attempt() {
+        let (url, mut requests) = reject_upgrades().await;
+        let err = async_nats::ConnectOptions::new()
+            .websocket_headers_callback(|| async {
+                let mut headers = HeaderMap::new();
+                headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
+                headers.insert(HOST, HeaderValue::from_static("elsewhere"));
+                Ok(headers)
+            })
+            .connect(url)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ConnectErrorKind::Io);
+        if let Ok(Some(head)) = tokio::time::timeout(Duration::from_secs(1), requests.recv()).await
+        {
+            assert_eq!(head, "", "the server got an upgrade request");
         }
     }
 }

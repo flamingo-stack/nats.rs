@@ -1359,8 +1359,10 @@ impl Connector {
                         ConnectError::with_source(ConnectErrorKind::Authentication, err)
                     })?;
                     for (name, value) in &headers {
+                        let mut value = value.clone();
+                        value.set_sensitive(true);
                         builder = builder
-                            .add_header(name.clone(), value.clone())
+                            .add_header(name.clone(), value)
                             .map_err(|err| ConnectError::with_source(ConnectErrorKind::Io, err))?;
                     }
                 }
